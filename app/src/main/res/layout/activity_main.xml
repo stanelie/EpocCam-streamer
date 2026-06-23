@@ -6,10 +6,11 @@
     android:background="#000000"
     android:clickable="true">
 
-    <SurfaceView
+    <com.exmachina.epoccamstreamer.AspectRatioSurfaceView
         android:id="@+id/surfaceView"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
 
     <TextView
         android:id="@+id/statusText"

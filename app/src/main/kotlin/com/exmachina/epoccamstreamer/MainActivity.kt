@@ -34,6 +34,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var statusText: TextView
     private lateinit var surfaceHolder: SurfaceHolder
+    private lateinit var previewView: AspectRatioSurfaceView
     private lateinit var focusModeButton: Button
     private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
     private var server: StreamingServer? = null
@@ -59,8 +60,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
         statusText = findViewById(R.id.statusText)
-        val sv = findViewById<android.view.SurfaceView>(R.id.surfaceView)
-        surfaceHolder = sv.holder
+        previewView = findViewById(R.id.surfaceView)
+        previewView.aspectRatio = FORMATS[currentFmt].first.toFloat() / FORMATS[currentFmt].second
+        surfaceHolder = previewView.holder
         surfaceHolder.addCallback(this)
 
         focusModeButton = findViewById(R.id.focusModeButton)
@@ -154,9 +156,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             Log.w(TAG, "stopping old encoder")
             old?.stop()
             Log.w(TAG, "old encoder stopped, starting new encoder ${FORMATS[fmt].first}×${FORMATS[fmt].second}")
+            // Update preview aspect ratio; surface will destroy+recreate and surfaceCreated
+            // will restore the preview holder once the new size is applied.
+            runOnUiThread {
+                previewView.aspectRatio = FORMATS[fmt].first.toFloat() / FORMATS[fmt].second
+                previewView.requestLayout()
+            }
             encoder = CameraEncoder(
                 context       = this,
-                previewHolder = if (surfaceHolder.surface.isValid) surfaceHolder else null,
+                previewHolder = null,  // surface is resizing; restored via surfaceCreated
                 width         = FORMATS[fmt].first,
                 height        = FORMATS[fmt].second,
                 fps           = fps,
