@@ -2,6 +2,7 @@ package com.exmachina.epoccamstreamer
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -13,6 +14,7 @@ import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
 import android.content.Intent
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.WindowManager
@@ -42,7 +44,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surfaceHolder: SurfaceHolder
     private lateinit var previewView: AspectRatioSurfaceView
     private lateinit var focusModeButton: Button
+    private lateinit var lockButton: Button
+    private lateinit var lockedBadge: TextView
     private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
+    private var locked = false
+    private var pinningConfirmed = false
     private var server: StreamingServer? = null
     @Volatile private var encoder: CameraEncoder? = null
     private var nsdManager: NsdManager? = null
@@ -101,6 +107,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 encoder?.setContinuousAf()
             }
         }
+
+        lockButton = findViewById(R.id.lockButton)
+        lockedBadge = findViewById(R.id.lockedBadge)
+        lockButton.setOnClickListener { enableLock() }
 
         val root = findViewById<FrameLayout>(R.id.rootLayout)
         root.setOnTouchListener { _, event ->
@@ -393,6 +403,54 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             i++
         }
         return -1
+    }
+
+    private val unlockPollHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val unlockPollRunnable = object : Runnable {
+        override fun run() {
+            if (!locked) return
+            val am = getSystemService(ActivityManager::class.java)
+            val state = am.getLockTaskModeState()
+            if (state == ActivityManager.LOCK_TASK_MODE_PINNED ||
+                state == ActivityManager.LOCK_TASK_MODE_LOCKED) {
+                pinningConfirmed = true
+            } else if (state == ActivityManager.LOCK_TASK_MODE_NONE && pinningConfirmed) {
+                disableLock()
+                return
+            }
+            unlockPollHandler.postDelayed(this, 500)
+        }
+    }
+
+    private fun enableLock() {
+        locked = true
+        pinningConfirmed = false
+        lockButton.visibility = View.GONE
+        lockedBadge.visibility = View.VISIBLE
+        startLockTask()
+        unlockPollHandler.postDelayed(unlockPollRunnable, 500)
+    }
+
+    private fun disableLock() {
+        locked = false
+        unlockPollHandler.removeCallbacks(unlockPollRunnable)
+        lockedBadge.visibility = View.GONE
+        lockButton.visibility = View.VISIBLE
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (locked) return true
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (locked) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (locked) return true
+        return super.onKeyUp(keyCode, event)
     }
 
     override fun onDestroy() {
