@@ -123,10 +123,16 @@ class CameraEncoder(
             override fun onConfigured(session: CameraCaptureSession) {
                 if (!running.get()) { session.close(); return }
                 captureSession = session
-                session.setRepeatingRequest(
-                    buildRequest(camera, preview, enc, currentAfApiMode),
-                    captureCallback, cameraHandler
-                )
+                try {
+                    session.setRepeatingRequest(
+                        buildRequest(camera, preview, enc, currentAfApiMode),
+                        captureCallback, cameraHandler
+                    )
+                } catch (e: IllegalStateException) {
+                    // Session was superseded by a newer createCaptureSession call before
+                    // this onConfigured callback fired. The newer session will take over.
+                    Log.w(TAG, "onConfigured: session already closed, superseded: $e")
+                }
             }
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 Log.e(TAG, "capture session config failed")
@@ -135,12 +141,17 @@ class CameraEncoder(
     }
 
     fun updatePreview(holder: SurfaceHolder?) {
+        val wasNull = previewHolder == null
         previewHolder = holder
         val cam = cameraDevice ?: return
+        // null→null means the surface resized during a format change where this encoder never
+        // had a preview. Restarting the session here would race with the onConfigured callback
+        // that's already coming. Let surfaceCreated deliver the first real holder instead.
+        if (wasNull && holder == null) return
         captureSession?.close()
         captureSession = null
         startCapture(cam)
-        requestIDR()
+        if (holder != null) requestIDR()
     }
 
     fun setContinuousAf() {

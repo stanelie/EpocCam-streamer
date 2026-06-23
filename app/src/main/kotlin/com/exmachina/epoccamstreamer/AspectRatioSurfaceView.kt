@@ -2,7 +2,10 @@ package com.exmachina.epoccamstreamer
 
 import android.content.Context
 import android.util.AttributeSet
+import android.util.Log
 import android.view.SurfaceView
+
+private const val TAG = "AspectSurfaceView"
 
 class AspectRatioSurfaceView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null
@@ -16,14 +19,13 @@ class AspectRatioSurfaceView @JvmOverloads constructor(
         val measuredW: Int
         val measuredH: Int
         if (w.toFloat() / h > aspectRatio) {
-            // Container is wider than content — constrain by height, pillarbox
             measuredW = (h * aspectRatio).toInt()
             measuredH = h
         } else {
-            // Container is taller than content — constrain by width, letterbox
             measuredW = w
             measuredH = (w / aspectRatio).toInt()
         }
+        Log.w(TAG, "onMeasure: container=${w}x${h} ratio=$aspectRatio → ${measuredW}x${measuredH}")
         setMeasuredDimension(measuredW, measuredH)
     }
 }

@@ -38,7 +38,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var focusModeButton: Button
     private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
     private var server: StreamingServer? = null
-    private var encoder: CameraEncoder? = null
+    @Volatile private var encoder: CameraEncoder? = null
     private var nsdManager: NsdManager? = null
     private var nsdRegistered  = false
     private var nsdRegistered2 = false
@@ -103,18 +103,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        Log.w(TAG, "surfaceCreated: encoder=$encoder server=$server")
         val cameraOk = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val audioOk  = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         if (!cameraOk || !audioOk) return
-        if (server != null) {
-            encoder?.updatePreview(holder)  // returning to foreground — restore preview
-        } else {
-            startStreaming()
-        }
+        if (server == null) startStreaming()
+        // Preview surface is connected in surfaceChanged, which always follows surfaceCreated
+        // and also fires on resize — resize does NOT trigger destroy+create on Android.
     }
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
+        Log.w(TAG, "surfaceChanged: ${w}x${h}")
+        if (server != null) encoder?.updatePreview(holder)
+    }
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        encoder?.updatePreview(null)  // drop preview but keep camera + encoder running
+        Log.w(TAG, "surfaceDestroyed: encoder=$encoder")
+        encoder?.updatePreview(null)
     }
 
     @Suppress("OVERRIDE_DEPRECATION")
@@ -156,23 +159,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             Log.w(TAG, "stopping old encoder")
             old?.stop()
             Log.w(TAG, "old encoder stopped, starting new encoder ${FORMATS[fmt].first}×${FORMATS[fmt].second}")
-            // Update preview aspect ratio; surface will destroy+recreate and surfaceCreated
-            // will restore the preview holder once the new size is applied.
-            runOnUiThread {
-                previewView.aspectRatio = FORMATS[fmt].first.toFloat() / FORMATS[fmt].second
-                previewView.requestLayout()
-            }
             encoder = CameraEncoder(
                 context       = this,
-                previewHolder = null,  // surface is resizing; restored via surfaceCreated
+                previewHolder = null,  // surfaceCreated will deliver it once aspect ratio resizes
                 width         = FORMATS[fmt].first,
                 height        = FORMATS[fmt].second,
                 fps           = fps,
                 bitrate       = BITRATES[fmt],
                 onNalUnit     = ::onNalUnit
             ).also { it.start() }
-            Log.w(TAG, "new encoder started, setting formatSelected=true")
             formatSelected.set(true)
+            Log.w(TAG, "new encoder started; posting aspect ratio update to main thread")
+            // Assign encoder BEFORE posting so the happens-before from Handler.post ensures
+            // the main thread sees the new encoder value when surfaceCreated fires.
+            runOnUiThread {
+                Log.w(TAG, "requestLayout: aspectRatio=${FORMATS[fmt].first}/${FORMATS[fmt].second}")
+                previewView.aspectRatio = FORMATS[fmt].first.toFloat() / FORMATS[fmt].second
+                previewView.requestLayout()
+            }
         }
     }
 
@@ -226,7 +230,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         ).also { it.start() }
         encoder = CameraEncoder(
             context       = this,
-            previewHolder = if (surfaceHolder.surface.isValid) surfaceHolder else null,
+            previewHolder = null,  // surfaceChanged delivers the holder once surface is ready
             width         = FORMATS[currentFmt].first,
             height        = FORMATS[currentFmt].second,
             fps           = fps,
