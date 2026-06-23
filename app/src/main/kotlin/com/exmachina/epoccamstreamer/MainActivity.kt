@@ -52,6 +52,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private val configSent     = AtomicBoolean(false)
     private val formatSelected = AtomicBoolean(false)
+
+    private val watchdogHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            val srv = server
+            if (srv != null && configSent.get()) {
+                val stale = srv.msSinceLastWrite()
+                if (stale != null && stale > 8_000L) {
+                    Log.w(TAG, "watchdog: no write in ${stale}ms — forcing reconnect")
+                    srv.forceDisconnect()
+                }
+            }
+            watchdogHandler.postDelayed(this, 3_000L)
+        }
+    }
     private var wifiLock: WifiManager.WifiLock? = null
     @Volatile private var codecConfig: ByteArray? = null
 
@@ -238,9 +253,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             onNalUnit     = ::onNalUnit
         ).also { it.start() }
         registerMdns()
+        watchdogHandler.postDelayed(watchdogRunnable, 3_000L)
     }
 
     private fun stopStreaming() {
+        watchdogHandler.removeCallbacks(watchdogRunnable)
         unregisterMdns()
         encoder?.stop(); encoder = null
         server?.stop();  server  = null

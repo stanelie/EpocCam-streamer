@@ -23,11 +23,23 @@ class StreamingServer(
 
     @Volatile private var output: OutputStream? = null
     @Volatile private var currentSocket: Socket? = null
-    // Single ServerSocket kept open for the server lifetime so reconnects never hit
-    // "connection refused" during the brief window between disconnect and re-accept.
     @Volatile private var serverSocket: ServerSocket? = null
+    @Volatile private var lastSuccessfulWriteMs = 0L
 
     var configPacket: ByteArray? = null
+
+    // Returns ms since last successful write, or null if no viewer connected / no write yet.
+    fun msSinceLastWrite(): Long? {
+        val last = lastSuccessfulWriteMs
+        return if (last == 0L || output == null) null
+        else android.os.SystemClock.elapsedRealtime() - last
+    }
+
+    fun forceDisconnect() {
+        Log.w(TAG, "forceDisconnect: closing socket for watchdog-triggered reconnect")
+        output = null
+        try { currentSocket?.close() } catch (_: Exception) {}
+    }
 
     private val listenThread = Thread({ listenLoop() }, "epoc-listen")
     private val sendThread   = Thread({ sendLoop() },   "epoc-send")
@@ -128,6 +140,7 @@ class StreamingServer(
         } catch (e: Exception) {
             Log.w(TAG, "connection lost: ${e.message}")
         } finally {
+            lastSuccessfulWriteMs = 0L
             output = null
             try { sock.close() } catch (_: Exception) {}
             currentSocket = null
@@ -138,21 +151,21 @@ class StreamingServer(
     }
 
     private fun sendLoop() {
-        var lastWriteMs = 0L
         while (running.get()) {
             try {
                 val packet = queue.poll(100, TimeUnit.MILLISECONDS) ?: continue
                 val out = output ?: continue
                 val now = android.os.SystemClock.elapsedRealtime()
-                if (lastWriteMs > 0) {
-                    val gap = now - lastWriteMs
+                val last = lastSuccessfulWriteMs
+                if (last > 0) {
+                    val gap = now - last
                     if (gap > 50) Log.w(TAG, "SEND GAP: ${gap}ms queue=${queue.size} pktSize=${packet.size}")
                 }
                 val t0 = android.os.SystemClock.elapsedRealtime()
                 out.write(packet)
                 val dt = android.os.SystemClock.elapsedRealtime() - t0
                 if (dt > 10) Log.w(TAG, "SLOW WRITE: ${dt}ms size=${packet.size}")
-                lastWriteMs = android.os.SystemClock.elapsedRealtime()
+                lastSuccessfulWriteMs = android.os.SystemClock.elapsedRealtime()
             } catch (e: InterruptedException) {
                 // Normal during shutdown
             } catch (e: Exception) {
