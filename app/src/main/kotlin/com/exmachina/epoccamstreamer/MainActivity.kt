@@ -9,8 +9,11 @@ import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
 import android.content.Intent
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.WindowManager
+import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -31,6 +34,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var statusText: TextView
     private lateinit var surfaceHolder: SurfaceHolder
+    private lateinit var focusModeButton: Button
+    private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
     private var server: StreamingServer? = null
     private var encoder: CameraEncoder? = null
     private var nsdManager: NsdManager? = null
@@ -57,10 +62,36 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val sv = findViewById<android.view.SurfaceView>(R.id.surfaceView)
         surfaceHolder = sv.holder
         surfaceHolder.addCallback(this)
+
+        focusModeButton = findViewById(R.id.focusModeButton)
+        focusModeButton.setOnClickListener {
+            tapFocusMode = !tapFocusMode
+            if (tapFocusMode) {
+                focusModeButton.text = "MF"
+            } else {
+                focusModeButton.text = "AF"
+                encoder?.setContinuousAf()
+            }
+        }
+
+        val root = findViewById<FrameLayout>(R.id.rootLayout)
+        root.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN && tapFocusMode) {
+                triggerFocus(); true
+            } else false
+        }
+
         val missingPerms = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
             .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (missingPerms.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, missingPerms.toTypedArray(), 1)
+        }
+    }
+
+    private fun triggerFocus() {
+        focusModeButton.text = "..."
+        encoder?.triggerAfAndLock { focused ->
+            runOnUiThread { focusModeButton.text = if (focused) "MF" else "MF?" }
         }
     }
 

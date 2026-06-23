@@ -13,6 +13,7 @@ import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "CameraEncoder"
 
@@ -37,6 +38,21 @@ class CameraEncoder(
 
     private val drainThread = Thread({ drainLoop() }, "epoc-drain")
     @Volatile private var nalLogCount = 0
+
+    // AF state
+    @Volatile private var currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+    private val afStateListener = AtomicReference<((Int) -> Unit)?>(null)
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            val state = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
+            afStateListener.get()?.invoke(state)
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun start() {
@@ -84,6 +100,21 @@ class CameraEncoder(
         }, cameraHandler)
     }
 
+    private fun buildRequest(
+        camera: CameraDevice,
+        preview: Surface?,
+        enc: Surface,
+        afMode: Int,
+        afTrigger: Int = CaptureRequest.CONTROL_AF_TRIGGER_IDLE
+    ) = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+        preview?.let { addTarget(it) }
+        addTarget(enc)
+        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
+        set(CaptureRequest.CONTROL_AF_MODE, afMode)
+        set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
+    }.build()
+
     private fun startCapture(camera: CameraDevice) {
         val enc = encoderSurface ?: return
         val preview = previewHolder?.surface
@@ -92,13 +123,10 @@ class CameraEncoder(
             override fun onConfigured(session: CameraCaptureSession) {
                 if (!running.get()) { session.close(); return }
                 captureSession = session
-                val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                    preview?.let { addTarget(it) }
-                    addTarget(enc)
-                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
-                }
-                session.setRepeatingRequest(req.build(), null, cameraHandler)
+                session.setRepeatingRequest(
+                    buildRequest(camera, preview, enc, currentAfApiMode),
+                    captureCallback, cameraHandler
+                )
             }
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 Log.e(TAG, "capture session config failed")
@@ -113,6 +141,58 @@ class CameraEncoder(
         captureSession = null
         startCapture(cam)
         requestIDR()
+    }
+
+    fun setContinuousAf() {
+        currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+        afStateListener.set(null)
+        val cam = cameraDevice ?: return
+        val session = captureSession ?: return
+        val enc = encoderSurface ?: return
+        val preview = previewHolder?.surface
+        try {
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO),
+                captureCallback, cameraHandler
+            )
+        } catch (e: Exception) { Log.e(TAG, "setContinuousAf failed: $e") }
+    }
+
+    fun triggerAfAndLock(onDone: (focused: Boolean) -> Unit) {
+        val cam = cameraDevice ?: return
+        val session = captureSession ?: return
+        val enc = encoderSurface ?: return
+        val preview = previewHolder?.surface
+        currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_AUTO
+        try {
+            // Cancel any prior lock so AF state machine resets
+            session.capture(
+                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_AUTO,
+                    CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
+                null, cameraHandler
+            )
+            // Arm listener before triggering
+            var reported = false
+            afStateListener.set { state ->
+                if (!reported && (state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                                  state == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)) {
+                    reported = true
+                    afStateListener.set(null)
+                    onDone(state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
+                }
+            }
+            // One-shot trigger
+            session.capture(
+                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_AUTO,
+                    CaptureRequest.CONTROL_AF_TRIGGER_START),
+                captureCallback, cameraHandler
+            )
+            // Repeating with AF_MODE_AUTO keeps AF locked and feeds state to the listener
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_AUTO),
+                captureCallback, cameraHandler
+            )
+        } catch (e: Exception) { Log.e(TAG, "triggerAfAndLock failed: $e") }
     }
 
     private fun drainLoop() {
@@ -200,6 +280,7 @@ class CameraEncoder(
     fun stop() {
         Log.w(TAG, "stop() called w=$width h=$height")
         running.set(false)
+        afStateListener.set(null)
         captureSession?.close(); captureSession = null
         cameraDevice?.close(); cameraDevice = null
         encoderSurface?.release(); encoderSurface = null
