@@ -3,6 +3,10 @@ package com.exmachina.epoccamstreamer
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
@@ -69,6 +73,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
     private var wifiLock: WifiManager.WifiLock? = null
     @Volatile private var codecConfig: ByteArray? = null
+
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var networkCallbackActive = false
+    private val networkActivateRunnable = Runnable { networkCallbackActive = true }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -231,6 +239,50 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         nsdRegistered = false; nsdRegistered2 = false
     }
 
+    private fun registerNetworkListener() {
+        networkCallbackActive = false
+        watchdogHandler.postDelayed(networkActivateRunnable, 5_000L)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (!networkCallbackActive || server == null) return
+                Log.w(TAG, "WiFi reconnected — refreshing mDNS and clearing stale connection")
+                runOnUiThread {
+                    val srv = server ?: return@runOnUiThread
+                    if (srv.hasActiveConnection()) {
+                        // onViewerDisconnected() will bounce mDNS once the socket closes
+                        srv.forceDisconnect()
+                    } else {
+                        // No active connection: re-announce directly so viewer can rediscover us
+                        unregisterMdns()
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            if (server != null) registerMdns()
+                        }, 1_000L)
+                    }
+                }
+            }
+        }
+        networkCallback = cb
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        try {
+            getSystemService(ConnectivityManager::class.java).registerNetworkCallback(request, cb)
+            Log.w(TAG, "network listener registered")
+        } catch (e: Exception) {
+            Log.e(TAG, "failed to register network callback: $e")
+        }
+    }
+
+    private fun unregisterNetworkListener() {
+        networkCallbackActive = false
+        watchdogHandler.removeCallbacks(networkActivateRunnable)
+        networkCallback?.let { cb ->
+            try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(cb) }
+            catch (_: Exception) {}
+            networkCallback = null
+        }
+    }
+
     private fun startStreaming() {
         if (server != null) return
         startForegroundService(Intent(this, StreamingService::class.java))
@@ -254,9 +306,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         ).also { it.start() }
         registerMdns()
         watchdogHandler.postDelayed(watchdogRunnable, 3_000L)
+        registerNetworkListener()
     }
 
     private fun stopStreaming() {
+        unregisterNetworkListener()
         watchdogHandler.removeCallbacks(watchdogRunnable)
         unregisterMdns()
         encoder?.stop(); encoder = null

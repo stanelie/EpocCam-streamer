@@ -35,8 +35,10 @@ class StreamingServer(
         else android.os.SystemClock.elapsedRealtime() - last
     }
 
+    fun hasActiveConnection() = output != null
+
     fun forceDisconnect() {
-        Log.w(TAG, "forceDisconnect: closing socket for watchdog-triggered reconnect")
+        Log.w(TAG, "forceDisconnect: closing socket")
         output = null
         try { currentSocket?.close() } catch (_: Exception) {}
     }
