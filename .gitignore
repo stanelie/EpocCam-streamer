@@ -1,0 +1,21 @@
+# Build outputs
+build/
+app/build/
+*.apk
+*.aab
+
+# Local machine config (contains SDK path)
+local.properties
+
+# Gradle caches
+.gradle/
+gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
