@@ -18,7 +18,7 @@ private const val TAG = "CameraEncoder"
 
 class CameraEncoder(
     private val context: Context,
-    private val previewHolder: SurfaceHolder,
+    @Volatile var previewHolder: SurfaceHolder?,
     private val width: Int,
     private val height: Int,
     private val fps: Int,
@@ -85,16 +85,18 @@ class CameraEncoder(
     }
 
     private fun startCapture(camera: CameraDevice) {
-        val surfaces = listOf(previewHolder.surface, encoderSurface!!)
+        val enc = encoderSurface ?: return
+        val preview = previewHolder?.surface
+        val surfaces = listOfNotNull(preview, enc)
         camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 if (!running.get()) { session.close(); return }
                 captureSession = session
                 val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                    addTarget(previewHolder.surface)
-                    addTarget(encoderSurface!!)
+                    preview?.let { addTarget(it) }
+                    addTarget(enc)
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))  // must match MainActivity.fps
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
                 }
                 session.setRepeatingRequest(req.build(), null, cameraHandler)
             }
@@ -102,6 +104,15 @@ class CameraEncoder(
                 Log.e(TAG, "capture session config failed")
             }
         }, cameraHandler)
+    }
+
+    fun updatePreview(holder: SurfaceHolder?) {
+        previewHolder = holder
+        val cam = cameraDevice ?: return
+        captureSession?.close()
+        captureSession = null
+        startCapture(cam)
+        requestIDR()
     }
 
     private fun drainLoop() {

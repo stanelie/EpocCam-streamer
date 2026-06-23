@@ -8,6 +8,7 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
+import android.content.Intent
 import android.view.SurfaceHolder
 import android.view.WindowManager
 import android.widget.TextView
@@ -71,10 +72,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun surfaceCreated(holder: SurfaceHolder) {
         val cameraOk = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val audioOk  = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        if (cameraOk && audioOk) startStreaming()
+        if (!cameraOk || !audioOk) return
+        if (server != null) {
+            encoder?.updatePreview(holder)  // returning to foreground — restore preview
+        } else {
+            startStreaming()
+        }
     }
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
-    override fun surfaceDestroyed(holder: SurfaceHolder) { stopStreaming() }
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        encoder?.updatePreview(null)  // drop preview but keep camera + encoder running
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        moveTaskToBack(true)  // minimize instead of finish
+    }
 
     fun onViewerDisconnected() {
         formatSelected.set(false)
@@ -112,7 +125,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             Log.w(TAG, "old encoder stopped, starting new encoder ${FORMATS[fmt].first}×${FORMATS[fmt].second}")
             encoder = CameraEncoder(
                 context       = this,
-                previewHolder = surfaceHolder,
+                previewHolder = if (surfaceHolder.surface.isValid) surfaceHolder else null,
                 width         = FORMATS[fmt].first,
                 height        = FORMATS[fmt].second,
                 fps           = fps,
@@ -162,6 +175,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun startStreaming() {
         if (server != null) return
+        startForegroundService(Intent(this, StreamingService::class.java))
         val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "epoccam_stream").also { it.acquire() }
         val capPkt = Protocol.buildCapabilityPacket()
@@ -173,7 +187,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         ).also { it.start() }
         encoder = CameraEncoder(
             context       = this,
-            previewHolder = surfaceHolder,
+            previewHolder = if (surfaceHolder.surface.isValid) surfaceHolder else null,
             width         = FORMATS[currentFmt].first,
             height        = FORMATS[currentFmt].second,
             fps           = fps,
@@ -258,5 +272,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return -1
     }
 
-    override fun onDestroy() { super.onDestroy(); stopStreaming() }
+    override fun onDestroy() {
+        super.onDestroy()
+        if (isFinishing) {
+            stopService(Intent(this, StreamingService::class.java))
+            stopStreaming()
+        }
+    }
 }
