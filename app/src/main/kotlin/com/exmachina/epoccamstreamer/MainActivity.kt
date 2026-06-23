@@ -16,6 +16,7 @@ import android.content.Intent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.WindowManager
+import android.view.View
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.TextView
@@ -37,6 +38,7 @@ private val BITRATES = listOf(3_500_000, 2_500_000)
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var statusText: TextView
+    private lateinit var notConnectedBanner: TextView
     private lateinit var surfaceHolder: SurfaceHolder
     private lateinit var previewView: AspectRatioSurfaceView
     private lateinit var focusModeButton: Button
@@ -83,6 +85,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
         statusText = findViewById(R.id.statusText)
+        notConnectedBanner = findViewById(R.id.notConnectedBanner)
         previewView = findViewById(R.id.surfaceView)
         previewView.aspectRatio = FORMATS[currentFmt].first.toFloat() / FORMATS[currentFmt].second
         surfaceHolder = previewView.holder
@@ -290,7 +293,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "epoccam_stream").also { it.acquire() }
         val capPkt = Protocol.buildCapabilityPacket()
         server = StreamingServer(
-            onStatus           = { msg -> runOnUiThread { statusText.text = msg } },
+            onStatus = { msg ->
+                runOnUiThread {
+                    statusText.text = msg
+                    val connected = msg.startsWith("Viewer connected")
+                    notConnectedBanner.visibility = if (connected) View.GONE else View.VISIBLE
+                }
+            },
             onFormatSelect     = { idx -> onFormatSelected(idx) },
             onViewerDisconnect = { onViewerDisconnected() },
             capabilityPacket   = capPkt

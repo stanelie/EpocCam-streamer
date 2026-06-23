@@ -23,6 +23,21 @@
         android:background="#80000000"
         android:text="Starting..." />
 
+    <TextView
+        android:id="@+id/notConnectedBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:gravity="center"
+        android:paddingTop="14dp"
+        android:paddingBottom="14dp"
+        android:text="NOT CONNECTED"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:background="#CCBB2222"
+        android:visibility="visible" />
+
     <Button
         android:id="@+id/focusModeButton"
         android:layout_width="64dp"
