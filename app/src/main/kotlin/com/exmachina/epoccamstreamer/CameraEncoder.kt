@@ -120,7 +120,7 @@ class CameraEncoder(
         set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
         set(CaptureRequest.CONTROL_AF_MODE, afMode)
         set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
-        set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+        set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
         set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
         set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_OFF)
         set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
@@ -133,7 +133,7 @@ class CameraEncoder(
         val enc = encoderSurface ?: return
         val preview = previewHolder?.surface
         val surfaces = listOfNotNull(preview, enc)
-        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+        try { camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 if (!running.get()) { session.close(); return }
                 captureSession = session
@@ -151,7 +151,9 @@ class CameraEncoder(
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 Log.e(TAG, "capture session config failed")
             }
-        }, cameraHandler)
+        }, cameraHandler) } catch (e: CameraAccessException) {
+            Log.w(TAG, "startCapture: camera disconnected before session configured: $e")
+        }
     }
 
     fun updatePreview(holder: SurfaceHolder?) {
