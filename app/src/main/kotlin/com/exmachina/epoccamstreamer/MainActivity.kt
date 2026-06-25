@@ -144,8 +144,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val audioOk  = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         if (!cameraOk || !audioOk) return
         if (server == null) startStreaming()
-        // Preview surface is connected in surfaceChanged, which always follows surfaceCreated
-        // and also fires on resize — resize does NOT trigger destroy+create on Android.
     }
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
         Log.w(TAG, "surfaceChanged: ${w}x${h}")
@@ -169,7 +167,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // Viewer waits for mDNS goodbye+reannounce before reconnecting after resolution change.
         runOnUiThread {
             unregisterMdns()
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ registerMdns() }, 400)
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (server != null) registerMdns()
+            }, 400)
         }
     }
 

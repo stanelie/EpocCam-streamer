@@ -12,6 +12,8 @@ import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
@@ -27,6 +29,7 @@ class CameraEncoder(
     private val onNalUnit: (data: ByteArray, offset: Int, size: Int, isSps: Boolean) -> Unit
 ) {
     private val running = AtomicBoolean(false)
+    private var cameraCloseLatch: CountDownLatch? = null
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -96,6 +99,10 @@ class CameraEncoder(
             }
             override fun onError(camera: CameraDevice, error: Int) {
                 Log.e(TAG, "onError $error"); camera.close(); cameraDevice = null
+            }
+            override fun onClosed(camera: CameraDevice) {
+                Log.w(TAG, "camera onClosed")
+                cameraCloseLatch?.countDown()
             }
         }, cameraHandler)
     }
@@ -300,7 +307,15 @@ class CameraEncoder(
         running.set(false)
         afStateListener.set(null)
         captureSession?.close(); captureSession = null
-        cameraDevice?.close(); cameraDevice = null
+        val cam = cameraDevice; cameraDevice = null
+        if (cam != null) {
+            cameraCloseLatch = CountDownLatch(1)
+            cam.close()
+            // Wait for HAL to confirm camera closed before releasing encoder surface.
+            // Without this, the camera HAL keeps writing to a released surface → buffer timeout.
+            cameraCloseLatch?.await(2, TimeUnit.SECONDS)
+            cameraCloseLatch = null
+        }
         encoderSurface?.release(); encoderSurface = null
         try { encoder?.stop() } catch (_: Exception) {}
         try { encoder?.release() } catch (_: Exception) {}
