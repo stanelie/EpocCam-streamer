@@ -35,7 +35,7 @@ private const val LISTEN_PORT = 5054
 // Must match the formats advertised in Protocol.buildCapabilityPacket(): index 0=HD, index 1=SD.
 private val FORMATS  = listOf(Pair(1280, 720), Pair(640, 480))
 // Bitrates from Android 1.13 smali: h.c=0x3567E0 for 1280×720, h.c=0x2625A0 for 720×480 (SD).
-private val BITRATES = listOf(3_500_000, 2_000_000)
+private val BITRATES = listOf(3_500_000, 1_200_000)
 
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
