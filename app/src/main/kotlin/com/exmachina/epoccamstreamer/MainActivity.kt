@@ -305,8 +305,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         server = StreamingServer(
             onStatus = { msg ->
                 runOnUiThread {
-                    statusText.text = msg
                     val connected = msg.startsWith("Viewer connected")
+                    statusText.text = if (connected) "Viewer connected" else msg
+                    statusText.setTextColor(if (connected) 0xFF00FF00.toInt() else 0xFFFFFFFF.toInt())
                     notConnectedBanner.visibility = if (connected) View.GONE else View.VISIBLE
                 }
             },
