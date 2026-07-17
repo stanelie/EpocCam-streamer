@@ -57,6 +57,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var nsdListener1: NsdManager.RegistrationListener? = null
     private var nsdListener2: NsdManager.RegistrationListener? = null
 
+    // Stable per-install id (survives reboots/IP changes/MAC rotation; only a factory
+    // reset or app-data wipe changes it). It does double duty: it makes this phone's
+    // mDNS instance name unique (two phones both named "mobile" would collapse into one
+    // on the viewer) AND it's advertised as the "id" the viewer uses as the slot key.
+    // No UI — the operator still assigns/swaps slots entirely on the viewer.
+    private val deviceId: String by lazy {
+        val prefs = getSharedPreferences("epoccam", MODE_PRIVATE)
+        prefs.getString("deviceId", null) ?: java.util.UUID.randomUUID().toString().also {
+            prefs.edit().putString("deviceId", it).apply()
+        }
+    }
+
     private val fps = 30
 
     // Default to SD (format index 1 = 640×480); switched to HD on viewer request.
@@ -230,18 +242,37 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         override fun onUnregistrationFailed(si: NsdServiceInfo, err: Int) { Log.e(TAG, "mDNS slot$slot unregistration failed: $err") }
     }
 
+    // First non-loopback IPv4 (wlan0). Advertised in TXT so the viewer connects to
+    // this exact phone, sidestepping the shared "Android.local" hostname that two
+    // Android phones both claim.
+    private fun localIpv4(): String? {
+        return try {
+            java.net.NetworkInterface.getNetworkInterfaces().toList()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { it.inetAddresses.toList() }
+                .firstOrNull { it is java.net.Inet4Address && !it.isLoopbackAddress }
+                ?.hostAddress
+        } catch (_: Exception) { null }
+    }
+
+    private fun mdnsServiceInfo(type: String) = NsdServiceInfo().apply {
+        // Unique instance name (short id) so both phones are discoverable; the full "id"
+        // TXT is the stable slot key; "ip" TXT is the current address to dial.
+        serviceName = "mobile-${deviceId.take(8)}"
+        serviceType = type
+        port = LISTEN_PORT
+        setAttribute("id", deviceId)
+        localIpv4()?.let { setAttribute("ip", it) }
+    }
+
     private fun registerMdns() {
         val mgr = getSystemService(NSD_SERVICE) as NsdManager
         nsdManager = mgr
         nsdListener1 = makeMdnsListener(1).also { listener ->
-            mgr.registerService(
-                NsdServiceInfo().apply { serviceName = "mobile"; serviceType = NSD_TYPE;  port = LISTEN_PORT },
-                NsdManager.PROTOCOL_DNS_SD, listener)
+            mgr.registerService(mdnsServiceInfo(NSD_TYPE),  NsdManager.PROTOCOL_DNS_SD, listener)
         }
         nsdListener2 = makeMdnsListener(2).also { listener ->
-            mgr.registerService(
-                NsdServiceInfo().apply { serviceName = "mobile"; serviceType = NSD_TYPE2; port = LISTEN_PORT },
-                NsdManager.PROTOCOL_DNS_SD, listener)
+            mgr.registerService(mdnsServiceInfo(NSD_TYPE2), NsdManager.PROTOCOL_DNS_SD, listener)
         }
     }
 
