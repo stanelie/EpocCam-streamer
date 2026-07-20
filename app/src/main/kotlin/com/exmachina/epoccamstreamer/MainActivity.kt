@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.ActivityManager
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -56,6 +57,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var nsdRegistered2 = false
     private var nsdListener1: NsdManager.RegistrationListener? = null
     private var nsdListener2: NsdManager.RegistrationListener? = null
+    // The IPv4 currently baked into the mDNS "ip" TXT. Tracked so we can re-advertise
+    // when the phone's address changes (e.g. Wi-Fi roam) — otherwise the viewer keeps
+    // dialing a stale address and can never reconnect.
+    @Volatile private var advertisedIp: String? = null
 
     // Stable per-install id (survives reboots/IP changes/MAC rotation; only a factory
     // reset or app-data wipe changes it). It does double duty: it makes this phone's
@@ -175,14 +180,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         formatSelected.set(false)
         configSent.set(false)
         server?.configPacket = null
-        Log.d(TAG, "viewer disconnected — reset stream gate, bouncing mDNS")
+        Log.d(TAG, "viewer disconnected — reset stream gate, refreshing mDNS")
         // Viewer waits for mDNS goodbye+reannounce before reconnecting after resolution change.
-        runOnUiThread {
-            unregisterMdns()
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                if (server != null) registerMdns()
-            }, 400)
-        }
+        scheduleMdnsRefresh()
     }
 
     fun onFormatSelected(index: Int) {
@@ -262,18 +262,36 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         serviceType = type
         port = LISTEN_PORT
         setAttribute("id", deviceId)
-        localIpv4()?.let { setAttribute("ip", it) }
+        advertisedIp?.let { setAttribute("ip", it) }
     }
 
     private fun registerMdns() {
         val mgr = getSystemService(NSD_SERVICE) as NsdManager
         nsdManager = mgr
+        advertisedIp = localIpv4()   // freeze the address we're about to advertise
         nsdListener1 = makeMdnsListener(1).also { listener ->
             mgr.registerService(mdnsServiceInfo(NSD_TYPE),  NsdManager.PROTOCOL_DNS_SD, listener)
         }
         nsdListener2 = makeMdnsListener(2).also { listener ->
             mgr.registerService(mdnsServiceInfo(NSD_TYPE2), NsdManager.PROTOCOL_DNS_SD, listener)
         }
+    }
+
+    // Coalesced re-announce: unregister, then register once after a short debounce. All
+    // re-registration (viewer disconnect, network change, IP change) goes through here so
+    // rapid triggers collapse into a single clean refresh instead of thrashing NSD.
+    private val mdnsRefreshRunnable = Runnable {
+        if (server == null) return@Runnable
+        Log.w(TAG, "mDNS refresh (ip=${localIpv4()})")
+        unregisterMdns()
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (server != null) registerMdns()
+        }, 300L)
+    }
+
+    private fun scheduleMdnsRefresh(delayMs: Long = 800L) {
+        watchdogHandler.removeCallbacks(mdnsRefreshRunnable)
+        watchdogHandler.postDelayed(mdnsRefreshRunnable, delayMs)
     }
 
     private fun unregisterMdns() {
@@ -292,16 +310,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 Log.w(TAG, "WiFi reconnected — refreshing mDNS and clearing stale connection")
                 runOnUiThread {
                     val srv = server ?: return@runOnUiThread
-                    if (srv.hasActiveConnection()) {
-                        // onViewerDisconnected() will bounce mDNS once the socket closes
-                        srv.forceDisconnect()
-                    } else {
-                        // No active connection: re-announce directly so viewer can rediscover us
-                        unregisterMdns()
-                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            if (server != null) registerMdns()
-                        }, 1_000L)
-                    }
+                    // Drop any active socket (its address may be stale); mDNS re-announce
+                    // happens via onViewerDisconnected → scheduleMdnsRefresh, else directly.
+                    if (srv.hasActiveConnection()) srv.forceDisconnect() else scheduleMdnsRefresh()
+                }
+            }
+
+            // Fires when the link's addresses change (e.g. Wi-Fi roam / DHCP renew), which
+            // onAvailable does NOT catch. If our IP moved, re-advertise so the viewer dials
+            // the new address instead of the stale one.
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (server == null) return
+                val current = localIpv4()
+                if (current != null && current != advertisedIp) {
+                    Log.w(TAG, "IP changed $advertisedIp -> $current — re-advertising mDNS")
+                    scheduleMdnsRefresh()
                 }
             }
         }
@@ -363,6 +386,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun stopStreaming() {
         unregisterNetworkListener()
         watchdogHandler.removeCallbacks(watchdogRunnable)
+        watchdogHandler.removeCallbacks(mdnsRefreshRunnable)
         unregisterMdns()
         encoder?.stop(); encoder = null
         server?.stop();  server  = null
