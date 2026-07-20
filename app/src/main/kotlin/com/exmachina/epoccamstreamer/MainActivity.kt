@@ -82,6 +82,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private val configSent     = AtomicBoolean(false)
     private val formatSelected = AtomicBoolean(false)
 
+    // Keyframe self-heal: track the last IDR so the watchdog can recreate a wedged
+    // encoder (one that stops emitting keyframes) while a viewer is connected.
+    @Volatile private var lastKeyframeMs = 0L
+    @Volatile private var lastEncoderRestartMs = 0L
+    private val encoderRestarting = AtomicBoolean(false)
+
     private val watchdogHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val watchdogRunnable = object : Runnable {
         override fun run() {
@@ -92,6 +98,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     Log.w(TAG, "watchdog: no write in ${stale}ms — forcing reconnect")
                     srv.forceDisconnect()
                 }
+            }
+            // Keyframe self-heal: a wedged MediaCodec keeps emitting P-frames but no IDR,
+            // so a viewer gets an undecodable stream. If no keyframe has flowed for a while
+            // with a viewer connected, recreate the encoder. Rate-limited so it can't storm.
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (srv != null && srv.hasActiveConnection() && formatSelected.get() &&
+                lastKeyframeMs > 0 && now - lastKeyframeMs > 5_000L &&
+                now - lastEncoderRestartMs > 10_000L) {
+                Log.w(TAG, "watchdog: no keyframe in ${now - lastKeyframeMs}ms — recreating encoder")
+                restartEncoderAsync()
             }
             watchdogHandler.postDelayed(this, 3_000L)
         }
@@ -189,6 +205,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val fmt = index.coerceIn(0, FORMATS.size - 1)
         Log.w(TAG, "onFormatSelected: idx=$fmt (${FORMATS[fmt].first}×${FORMATS[fmt].second}) currentFmt=$currentFmt configSent=${configSent.get()} formatSelected=${formatSelected.get()} codecConfig=${codecConfig?.size}B")
         configSent.set(false)
+        lastKeyframeMs = android.os.SystemClock.elapsedRealtime()  // start the keyframe watchdog window from this (re)connect
 
         if (fmt == currentFmt) {
             // Same resolution: just open gate and request a fresh IDR.
@@ -226,6 +243,43 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 previewView.requestLayout()
             }
         }
+    }
+
+    // Backstop for a MediaCodec that wedged (stops emitting keyframes): tear it down and
+    // build a fresh one at the current resolution. Runs off the main thread (stop() blocks
+    // on the camera close) and is single-flighted via encoderRestarting.
+    private fun restartEncoderAsync() {
+        if (!encoderRestarting.compareAndSet(false, true)) return
+        lastEncoderRestartMs = android.os.SystemClock.elapsedRealtime()
+        Thread({
+            try {
+                Log.w(TAG, "SELF-HEAL: recreating encoder (currentFmt=$currentFmt)")
+                formatSelected.set(false)
+                configSent.set(false)
+                codecConfig = null
+                server?.flushQueue()
+                val old = encoder
+                encoder = null
+                old?.stop()
+                val fmt = currentFmt
+                encoder = CameraEncoder(
+                    context       = this,
+                    previewHolder = null,  // stream-only; local preview isn't needed to recover the feed
+                    width         = FORMATS[fmt].first,
+                    height        = FORMATS[fmt].second,
+                    fps           = fps,
+                    bitrate       = BITRATES[fmt],
+                    onNalUnit     = ::onNalUnit
+                ).also { it.start() }
+                lastKeyframeMs = android.os.SystemClock.elapsedRealtime()
+                formatSelected.set(true)
+                Log.w(TAG, "SELF-HEAL: encoder recreated")
+            } catch (e: Exception) {
+                Log.e(TAG, "SELF-HEAL failed: $e")
+            } finally {
+                encoderRestarting.set(false)
+            }
+        }, "epoc-encoder-heal").start()
     }
 
     private fun makeMdnsListener(slot: Int) = object : NsdManager.RegistrationListener {
@@ -416,6 +470,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val cfg = codecConfig ?: return  // drop frames from old encoder until new SPS arrives
         val nalHeaderIdx = findFirstNalByte(data, offset, size)
         val isIdr = nalHeaderIdx >= 0 && (data[nalHeaderIdx].toInt() and 0x1F) == 5
+        if (isIdr) lastKeyframeMs = android.os.SystemClock.elapsedRealtime()  // healthy keyframe flow
         if (isIdr && configSent.compareAndSet(false, true)) {
             // Match iPhone wire protocol exactly:
             // 1. 4-byte pre-packet (00 00 00 05) — signals decoder reset to viewer

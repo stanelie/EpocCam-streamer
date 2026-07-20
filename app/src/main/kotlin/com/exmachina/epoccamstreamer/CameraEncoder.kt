@@ -76,7 +76,7 @@ class CameraEncoder(
         val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 60) // on-demand IDRs via requestIDR(); 60s fallback only
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // auto keyframe every 1s: instant viewer join + loss recovery
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
