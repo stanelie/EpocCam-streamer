@@ -119,6 +119,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var networkCallbackActive = false
     private val networkActivateRunnable = Runnable { networkCallbackActive = true }
 
+    companion object {
+        // The MainActivity that currently owns the stream (camera + port 5054 + foreground
+        // service). Streaming keeps running in the background, so a later launch can collide
+        // with a still-live instance. A fresh start tears this one down first for a clean start.
+        @Volatile private var active: MainActivity? = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -263,8 +270,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 old?.stop()
                 val fmt = currentFmt
                 encoder = CameraEncoder(
+                    // Keep the local preview live across the recreate (only if the surface is
+                    // valid — i.e. app is foregrounded; when backgrounded it's stream-only).
                     context       = this,
-                    previewHolder = null,  // stream-only; local preview isn't needed to recover the feed
+                    previewHolder = surfaceHolder.takeIf { it.surface?.isValid == true },
                     width         = FORMATS[fmt].first,
                     height        = FORMATS[fmt].second,
                     fps           = fps,
@@ -406,6 +415,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun startStreaming() {
         if (server != null) return
+        val previous = active
+        if (previous != null && previous !== this) {
+            // A previous/orphaned instance still owns the camera + port 5054 (streaming in the
+            // background). Tear it down — the stop() blocks on the camera close, so do it off
+            // the main thread — then start fresh. Guarantees a clean start every launch.
+            Log.w(TAG, "startStreaming: tearing down previous instance for a clean start")
+            Thread({
+                try { previous.stopStreaming() } catch (e: Exception) { Log.e(TAG, "orphan teardown: $e") }
+                runOnUiThread { if (server == null && !isFinishing) startStreamingClean() }
+            }, "epoc-orphan-teardown").start()
+            return
+        }
+        startStreamingClean()
+    }
+
+    private fun startStreamingClean() {
+        if (server != null) return
+        active = this
         startForegroundService(Intent(this, StreamingService::class.java))
         val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "epoccam_stream").also { it.acquire() }
@@ -437,14 +464,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         registerNetworkListener()
     }
 
+    @Synchronized
     private fun stopStreaming() {
+        if (active === this) active = null
         unregisterNetworkListener()
         watchdogHandler.removeCallbacks(watchdogRunnable)
         watchdogHandler.removeCallbacks(mdnsRefreshRunnable)
         unregisterMdns()
-        encoder?.stop(); encoder = null
-        server?.stop();  server  = null
-        wifiLock?.release(); wifiLock = null
+        // Capture-then-null so a concurrent stop (orphan teardown + onDestroy) is a no-op.
+        val e = encoder; encoder = null
+        val s = server;  server  = null
+        val w = wifiLock; wifiLock = null
+        e?.stop()    // blocks until the camera HAL confirms close (frees it for the next start)
+        s?.stop()
+        try { w?.release() } catch (_: Exception) {}
     }
 
     private fun onNalUnit(data: ByteArray, offset: Int, size: Int, isSps: Boolean) {
