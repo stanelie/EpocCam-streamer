@@ -3,7 +3,11 @@ package com.exmachina.epoccamstreamer
 import android.Manifest
 import android.app.Activity
 import android.app.ActivityManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.BatteryManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -47,6 +51,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var focusModeButton: Button
     private lateinit var lockButton: Button
     private lateinit var lockedBadge: TextView
+    private lateinit var batteryText: TextView
+
+    // Battery overlay: level + charging state, so an operator can see at a glance whether a
+    // phone is about to die mid-show. ACTION_BATTERY_CHANGED is sticky, so registering the
+    // receiver delivers the current state immediately.
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            intent ?: return
+            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+            if (level < 0 || scale <= 0) return
+            val pct = level * 100 / scale
+            val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                           status == BatteryManager.BATTERY_STATUS_FULL ||
+                           intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+            batteryText.text = if (charging) "⚡$pct%" else "$pct%"
+            batteryText.setTextColor(when {
+                charging  -> 0xFF00FF00.toInt()   // charging
+                pct <= 15 -> 0xFFFF4444.toInt()   // critical
+                pct <= 30 -> 0xFFFFCC00.toInt()   // low
+                else      -> 0xFFFFFFFF.toInt()
+            })
+        }
+    }
     private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
     private var locked = false
     private var pinningConfirmed = false
@@ -151,6 +180,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         lockButton = findViewById(R.id.lockButton)
         lockedBadge = findViewById(R.id.lockedBadge)
         lockButton.setOnClickListener { enableLock() }
+
+        batteryText = findViewById(R.id.batteryText)
+        registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
 
         val root = findViewById<FrameLayout>(R.id.rootLayout)
         root.setOnTouchListener { _, event ->
@@ -599,6 +631,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onDestroy() {
         super.onDestroy()
+        try { unregisterReceiver(batteryReceiver) } catch (_: Exception) {}
         if (isFinishing) {
             stopService(Intent(this, StreamingService::class.java))
             stopStreaming()
