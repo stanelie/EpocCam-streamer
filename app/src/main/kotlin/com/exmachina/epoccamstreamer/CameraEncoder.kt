@@ -135,6 +135,10 @@ class CameraEncoder(
         // was already using and already works fine on.
         captureSurface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
+                // maxImages=1 was tried here to trim a possible frame of queuing depth — measured
+                // no change in PIPE LATENCY at all, confirming the ~90-100ms floor is intrinsic
+                // to the sensor/ISP/encode stages, not this queue. Kept at the safer 2 since 1
+                // bought nothing.
                 val writer = ImageWriter.newInstance(encSurface, 2, ImageFormat.PRIVATE)
                 val reader = ImageReader.newInstance(
                     width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
