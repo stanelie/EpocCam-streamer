@@ -84,6 +84,12 @@ class StreamingServer(
                 val sock = srv.accept()
                 Log.w(TAG, "accept: got connection")
                 sock.tcpNoDelay = true
+                // Cap the kernel send buffer so a real Wi-Fi throughput shortfall shows up as
+                // backpressure (slow write()) the app can react to, instead of disappearing into
+                // auto-tuned kernel buffering — which can silently hold a second+ of stale video
+                // while write() keeps returning instantly, masking the real bottleneck from the
+                // app-level queue/drop logic entirely.
+                try { sock.sendBufferSize = 65536 } catch (e: Exception) { Log.w(TAG, "setSendBufferSize failed: ${e.message}") }
                 val addr = sock.inetAddress.hostAddress
                 onStatus("Viewer connected ($addr)")
                 Log.w(TAG, "connection accepted from $addr configPacket=${if (configPacket != null) "${configPacket!!.size}B" else "null"}")
