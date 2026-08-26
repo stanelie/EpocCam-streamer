@@ -2,11 +2,17 @@ package com.exmachina.epoccamstreamer
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
 import android.hardware.camera2.*
+import android.media.Image
+import android.media.ImageReader
+import android.media.ImageWriter
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -35,6 +41,14 @@ class CameraEncoder(
     private var captureSession: CameraCaptureSession? = null
     private var encoder: MediaCodec? = null
     private var encoderSurface: Surface? = null
+
+    // On API 29+ the camera targets imageReader instead of the encoder's input surface
+    // directly — see the giant comment in start() for why. captureSurface is whichever of
+    // the two the camera is actually targeting; buildRequest()/startCapture() etc. only
+    // ever touch captureSurface, never encoderSurface directly.
+    private var imageReader: ImageReader? = null
+    private var imageWriter: ImageWriter? = null
+    private var captureSurface: Surface? = null
 
     private val cameraThread = HandlerThread("epoc-camera").also { it.start() }
     private val cameraHandler = Handler(cameraThread.looper)
@@ -80,13 +94,73 @@ class CameraEncoder(
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            // Left unset, this encoder defaults to VBR (confirmed via outputFormat's
+            // "bitrate-mode=1"), which needs to look ahead across future frames to decide bit
+            // allocation — exactly the kind of frame-buffering that adds pipeline latency, and
+            // vendors vary widely in how deep that look-ahead runs. CBR can make its decision
+            // frame-by-frame with no look-ahead, which is why real-time encoders request it.
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            // Some hardware encoders (notably Qualcomm's) hold several frames in an internal
+            // look-ahead/rate-control pipeline by default, adding real latency before a frame
+            // ever reaches drainLoop(). This asks the encoder to target ~1 frame of internal
+            // buffering instead. Ignored by encoders that don't support the hint.
+            setInteger(MediaFormat.KEY_LATENCY, 1)
+            // Qualcomm's Codec2 AVC encoder (c2.qti.avc.encoder) ignores the generic
+            // KEY_LATENCY hint above but honors this vendor extension to disable its
+            // internal rate-control look-ahead. Harmless no-op on encoders that don't
+            // recognize it (e.g. Exynos).
+            setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
         }
         val enc = MediaCodec.createEncoderByType("video/avc")
         enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoderSurface = enc.createInputSurface()
+        val encSurface = enc.createInputSurface()
+        encoderSurface = encSurface
         enc.start()
         encoder = enc
         drainThread.start()
+
+        // Feeding the camera directly into MediaCodec.createInputSurface() is the documented,
+        // "recommended" zero-copy path — but on several Qualcomm-based devices (confirmed on
+        // Pixel phones; see https://issuetracker.google.com/issues/254027327, closed "Won't
+        // Fix (Obsolete)" by Google without a platform fix) that input surface's underlying
+        // HardwareBuffer usage flag (USAGE_VIDEO_ENCODE) puts the driver into a mode that holds
+        // ~1s of frames, independent of any MediaCodec/CaptureRequest configuration — matches
+        // what we measured directly here (PIPE LATENCY stayed ~500ms through four different
+        // encoder/capture tunables). Routing frames through ImageReader -> ImageWriter instead
+        // avoids that flag entirely while remaining a zero-copy GPU buffer handoff (confirmed
+        // fix in that same bug thread). The APIs this needs (ImageWriter.newInstance with an
+        // explicit format, ImageReader.newInstance with an explicit usage flag) only exist from
+        // API 29 — below that we fall back to the direct-Surface path, which is what every
+        // non-Qualcomm-affected device (e.g. the Samsung S6/S7 this app is normally used with)
+        // was already using and already works fine on.
+        captureSurface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val writer = ImageWriter.newInstance(encSurface, 2, ImageFormat.PRIVATE)
+                val reader = ImageReader.newInstance(
+                    width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+                )
+                reader.setOnImageAvailableListener({ r ->
+                    val image: Image = try { r.acquireLatestImage() } catch (e: Exception) {
+                        Log.w(TAG, "acquireLatestImage failed: $e"); null
+                    } ?: return@setOnImageAvailableListener
+                    try {
+                        writer.queueInputImage(image)  // takes ownership of image on success
+                    } catch (e: Exception) {
+                        Log.w(TAG, "queueInputImage failed: $e")
+                        image.close()
+                    }
+                }, cameraHandler)
+                imageWriter = writer
+                imageReader = reader
+                Log.w(TAG, "using ImageReader/ImageWriter path (avoids Surface-input encoder latency)")
+                reader.surface
+            } catch (e: Exception) {
+                Log.w(TAG, "ImageReader/ImageWriter setup failed, falling back to direct Surface: $e")
+                encSurface
+            }
+        } else {
+            encSurface
+        }
 
         manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
@@ -120,6 +194,9 @@ class CameraEncoder(
         addTarget(enc)
         set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
+        // TEMPLATE_RECORD is documented to disable ZSL, but some HALs (notably Pixel's) still
+        // run a ring-buffer/multi-frame pipeline on the record output. Explicit belt-and-braces.
+        set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
         set(CaptureRequest.CONTROL_AF_MODE, afMode)
         set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
         set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
@@ -132,7 +209,7 @@ class CameraEncoder(
     }.build()
 
     private fun startCapture(camera: CameraDevice) {
-        val enc = encoderSurface ?: return
+        val enc = captureSurface ?: return
         val preview = previewHolder?.surface
         val surfaces = listOfNotNull(preview, enc)
         try { camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
@@ -177,7 +254,7 @@ class CameraEncoder(
         afStateListener.set(null)
         val cam = cameraDevice ?: return
         val session = captureSession ?: return
-        val enc = encoderSurface ?: return
+        val enc = captureSurface ?: return
         val preview = previewHolder?.surface
         try {
             session.setRepeatingRequest(
@@ -190,7 +267,7 @@ class CameraEncoder(
     fun triggerAfAndLock(onDone: (focused: Boolean) -> Unit) {
         val cam = cameraDevice ?: return
         val session = captureSession ?: return
-        val enc = encoderSurface ?: return
+        val enc = captureSurface ?: return
         val preview = previewHolder?.surface
         currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_AUTO
         try {
@@ -251,6 +328,17 @@ class CameraEncoder(
             lastNalMs = now
             if (now - lastHeartbeatMs >= 2000) {
                 Log.w(TAG, "heartbeat: $frameCount NAL units in last 2s")
+                // presentationTimeUs is the camera-buffer timestamp propagated straight through
+                // the Surface into the encoder. Diffing it against wall clock (in both plausible
+                // clock domains — camera timestamps are elapsedRealtime-based on most devices,
+                // uptime-based on some) measures how long THIS frame sat in the camera->encoder
+                // pipe before the encoder emitted it, isolating a HAL/ISP pipeline delay from
+                // anything downstream (network/receiver).
+                val nowRealtimeUs = android.os.SystemClock.elapsedRealtimeNanos() / 1000
+                val nowUptimeUs = android.os.SystemClock.uptimeMillis() * 1000
+                Log.w(TAG, "PIPE LATENCY: pts=${info.presentationTimeUs}us " +
+                        "vsRealtime=${(nowRealtimeUs - info.presentationTimeUs) / 1000}ms " +
+                        "vsUptime=${(nowUptimeUs - info.presentationTimeUs) / 1000}ms")
                 frameCount = 0; lastHeartbeatMs = now
             }
 
@@ -320,6 +408,11 @@ class CameraEncoder(
             cameraCloseLatch?.await(2, TimeUnit.SECONDS)
             cameraCloseLatch = null
         }
+        try { imageReader?.close() } catch (_: Exception) {}
+        imageReader = null
+        try { imageWriter?.close() } catch (_: Exception) {}
+        imageWriter = null
+        captureSurface = null
         encoderSurface?.release(); encoderSurface = null
         try { encoder?.stop() } catch (_: Exception) {}
         try { encoder?.release() } catch (_: Exception) {}
