@@ -120,20 +120,28 @@ class CameraEncoder(
         drainThread.start()
 
         // Feeding the camera directly into MediaCodec.createInputSurface() is the documented,
-        // "recommended" zero-copy path — but on several Qualcomm-based devices (confirmed on
-        // Pixel phones; see https://issuetracker.google.com/issues/254027327, closed "Won't
-        // Fix (Obsolete)" by Google without a platform fix) that input surface's underlying
-        // HardwareBuffer usage flag (USAGE_VIDEO_ENCODE) puts the driver into a mode that holds
-        // ~1s of frames, independent of any MediaCodec/CaptureRequest configuration — matches
-        // what we measured directly here (PIPE LATENCY stayed ~500ms through four different
-        // encoder/capture tunables). Routing frames through ImageReader -> ImageWriter instead
-        // avoids that flag entirely while remaining a zero-copy GPU buffer handoff (confirmed
-        // fix in that same bug thread). The APIs this needs (ImageWriter.newInstance with an
-        // explicit format, ImageReader.newInstance with an explicit usage flag) only exist from
-        // API 29 — below that we fall back to the direct-Surface path, which is what every
-        // non-Qualcomm-affected device (e.g. the Samsung S6/S7 this app is normally used with)
-        // was already using and already works fine on.
-        captureSurface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        // "recommended" zero-copy path — but on Qualcomm-based devices (confirmed on a Pixel 5;
+        // see https://issuetracker.google.com/issues/254027327, closed "Won't Fix (Obsolete)" by
+        // Google without a platform fix) that input surface's underlying HardwareBuffer usage
+        // flag (USAGE_VIDEO_ENCODE) puts the driver into a mode that holds ~1s of frames,
+        // independent of any MediaCodec/CaptureRequest configuration — matches what we measured
+        // directly here (PIPE LATENCY stayed ~500ms through four different encoder/capture
+        // tunables). Routing frames through ImageReader -> ImageWriter instead avoids that flag
+        // while remaining a zero-copy GPU buffer handoff (the fix confirmed in that bug thread).
+        //
+        // Restricted to Qualcomm hardware on purpose: the workaround is for a Qualcomm driver
+        // quirk, and it actively breaks other vendors — on a Samsung Exynos S6 (which is also
+        // API 29, so a version-only gate wrongly enabled it) this path encodes a solid green
+        // frame, even though the phone's own preview stays correct. Everything else keeps the
+        // direct-Surface path, which those devices were already using with no latency problem.
+        // Build.SOC_MANUFACTURER is API 31+, so it's only consulted on devices that have it;
+        // Build.HARDWARE ("qcom") covers the rest, including the API 29 devices in play here.
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MANUFACTURER else ""
+        val isQualcomm = Build.HARDWARE.startsWith("qcom", ignoreCase = true) ||
+                         soc.equals("QTI", ignoreCase = true) ||
+                         soc.contains("Qualcomm", ignoreCase = true)
+        Log.w(TAG, "capture path: hardware=${Build.HARDWARE} soc=$soc isQualcomm=$isQualcomm")
+        captureSurface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && isQualcomm) {
             try {
                 // maxImages=1 was tried here to trim a possible frame of queuing depth — measured
                 // no change in PIPE LATENCY at all, confirming the ~90-100ms floor is intrinsic
@@ -256,11 +264,21 @@ class CameraEncoder(
     fun setContinuousAf() {
         currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
         afStateListener.set(null)
-        val cam = cameraDevice ?: return
-        val session = captureSession ?: return
-        val enc = captureSurface ?: return
+        val cam = cameraDevice ?: run { Log.w(TAG, "setContinuousAf: no cameraDevice, ignored"); return }
+        val session = captureSession ?: run { Log.w(TAG, "setContinuousAf: no captureSession, ignored"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "setContinuousAf: no captureSurface, ignored"); return }
         val preview = previewHolder?.surface
         try {
+            // Explicitly cancel the active trigger/lock before resuming continuous AF — on this
+            // HAL, just changing CONTROL_AF_MODE back to CONTINUOUS_VIDEO isn't enough to release
+            // it: the lens stays parked at its locked position (confirmed by direct testing: the
+            // repeating request below was already being sent successfully, but focus never
+            // actually resumed moving until this cancel was added).
+            session.capture(
+                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+                    CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
+                null, cameraHandler
+            )
             session.setRepeatingRequest(
                 buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO),
                 captureCallback, cameraHandler
@@ -269,9 +287,9 @@ class CameraEncoder(
     }
 
     fun triggerAfAndLock(onDone: (focused: Boolean) -> Unit) {
-        val cam = cameraDevice ?: return
-        val session = captureSession ?: return
-        val enc = captureSurface ?: return
+        val cam = cameraDevice ?: run { Log.w(TAG, "triggerAfAndLock: no cameraDevice, ignored"); return }
+        val session = captureSession ?: run { Log.w(TAG, "triggerAfAndLock: no captureSession, ignored"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "triggerAfAndLock: no captureSurface, ignored"); return }
         val preview = previewHolder?.surface
         currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_AUTO
         try {

@@ -84,6 +84,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var lastBatteryPct = -1
     @Volatile private var lastBatteryCharging = false
     private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
+    // Guards triggerFocus() against overlapping calls: without it, a second tap landing while
+    // the first is still converging silently resets the whole AF trigger sequence (cancelling
+    // the in-flight attempt), so focus can appear to never lock and the button text flickers as
+    // separate attempts' callbacks land out of order.
+    @Volatile private var focusInProgress = false
+    private val focusTimeoutHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var locked = false
     private var pinningConfirmed = false
     private var server: StreamingServer? = null
@@ -192,8 +198,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         focusModeButton.setOnClickListener {
             tapFocusMode = !tapFocusMode
             if (tapFocusMode) {
-                focusModeButton.text = "MF"
+                // Lock focus immediately — don't wait for a separate screen tap. A later tap
+                // (while already in MF mode) re-locks at that point via the same path.
+                triggerFocus()
             } else {
+                // Cancel any in-flight tap-focus attempt so its timeout can't later overwrite
+                // this "AF" with a stale "MF?" — encoder.setContinuousAf() already clears the
+                // camera-side AF listener, which would otherwise leave triggerAfAndLock's
+                // onDone never called and focusInProgress stuck.
+                focusInProgress = false
+                focusTimeoutHandler.removeCallbacksAndMessages(null)
                 focusModeButton.text = "AF"
                 encoder?.setContinuousAf()
             }
@@ -221,10 +235,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun triggerFocus() {
+        if (focusInProgress) return  // ignore a retap while the previous attempt is still converging
+        val enc = encoder ?: return
+        focusInProgress = true
         focusModeButton.text = "..."
-        encoder?.triggerAfAndLock { focused ->
-            runOnUiThread { focusModeButton.text = if (focused) "MF" else "MF?" }
-        }
+        // Safety net: if the camera never reports a final AF state (edge case — see
+        // CameraEncoder.triggerAfAndLock), don't leave focus permanently stuck ignoring taps.
+        focusTimeoutHandler.postDelayed({ finishFocus(focused = false) }, 4_000L)
+        enc.triggerAfAndLock { focused -> runOnUiThread { finishFocus(focused) } }
+    }
+
+    private fun finishFocus(focused: Boolean) {
+        if (!focusInProgress) return  // already finished (e.g. the timeout fired after the real callback)
+        focusInProgress = false
+        focusTimeoutHandler.removeCallbacksAndMessages(null)
+        focusModeButton.text = if (focused) "MF" else "MF?"
     }
 
     override fun onRequestPermissionsResult(req: Int, perms: Array<String>, results: IntArray) {

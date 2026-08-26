@@ -38,6 +38,7 @@
         android:background="#CCBB2222"
         android:visibility="visible" />
 
+    <!-- Battery + focus toggle: upper-right, out of the way of the lock button below. -->
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -60,34 +61,44 @@
 
         <Button
             android:id="@+id/focusModeButton"
-            android:layout_width="64dp"
-            android:layout_height="36dp"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
             android:text="AF"
-            android:textSize="12sp"
+            android:textSize="18sp"
             android:textColor="#FFFFFF"
             android:backgroundTint="#80000000"
             android:padding="0dp" />
 
+    </LinearLayout>
+
+    <!-- Lock: lower-right, away from the top of frame where tap-to-focus is most likely
+         (moving it here fixed manual-focus taps near a framed subject accidentally hitting it). -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="8dp"
+        android:orientation="vertical"
+        android:gravity="end">
+
         <Button
             android:id="@+id/lockButton"
-            android:layout_width="64dp"
-            android:layout_height="36dp"
-            android:layout_marginTop="6dp"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
             android:text="LOCK"
-            android:textSize="11sp"
+            android:textSize="16sp"
             android:textColor="#FFFFFF"
             android:backgroundTint="#CC224488"
             android:padding="0dp" />
 
         <TextView
             android:id="@+id/lockedBadge"
-            android:layout_width="64dp"
-            android:layout_height="36dp"
-            android:layout_marginTop="6dp"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
             android:gravity="center"
             android:text="LOCKED"
             android:textColor="#FFFFFF"
-            android:textSize="11sp"
+            android:textSize="16sp"
             android:textStyle="bold"
             android:background="#CC992222"
             android:visibility="gone" />
