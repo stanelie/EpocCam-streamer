@@ -91,16 +91,15 @@ class StreamingServer(
                 // app-level queue/drop logic entirely.
                 try { sock.sendBufferSize = 65536 } catch (e: Exception) { Log.w(TAG, "setSendBufferSize failed: ${e.message}") }
                 val addr = sock.inetAddress.hostAddress
-                onStatus("Viewer connected ($addr)")
                 Log.w(TAG, "connection accepted from $addr configPacket=${if (configPacket != null) "${configPacket!!.size}B" else "null"}")
-                handleConnection(sock)
+                handleConnection(sock, addr)
             } catch (e: Exception) {
                 if (running.get()) Log.w(TAG, "listen: ${e.message}")
             }
         }
     }
 
-    private fun handleConnection(sock: Socket) {
+    private fun handleConnection(sock: Socket, addr: String?) {
         currentSocket = sock
         try {
             val out = sock.getOutputStream()
@@ -110,6 +109,11 @@ class StreamingServer(
 
             queue.clear()
             output = out
+            // Fire the "connected" status only once `output` is actually set — a caller
+            // reacting to this (e.g. sending an immediate battery report) via enqueue()
+            // would otherwise silently no-op, since enqueue() drops packets while output
+            // is still null.
+            onStatus("Viewer connected ($addr)")
 
             val inp = sock.getInputStream()
             val rxBuf = ByteArray(256)

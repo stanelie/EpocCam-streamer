@@ -67,6 +67,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                            status == BatteryManager.BATTERY_STATUS_FULL ||
                            intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+            lastBatteryPct = pct
+            lastBatteryCharging = charging
             batteryText.text = if (charging) "⚡$pct%" else "$pct%"
             batteryText.setTextColor(when {
                 charging  -> 0xFF00FF00.toInt()   // charging
@@ -76,6 +78,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             })
         }
     }
+    // Cached from the sticky ACTION_BATTERY_CHANGED above so the periodic wire report (which
+    // runs on its own once-a-minute cadence, decoupled from the on-device overlay's live
+    // updates) always has a current value to send without querying BatteryManager itself.
+    @Volatile private var lastBatteryPct = -1
+    @Volatile private var lastBatteryCharging = false
     private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
     private var locked = false
     private var pinningConfirmed = false
@@ -140,6 +147,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
             watchdogHandler.postDelayed(this, 3_000L)
         }
+    }
+    // Reports battery level/charging to the viewer once a minute — separate from the on-device
+    // overlay above, which updates live on every ACTION_BATTERY_CHANGED. Also fired once
+    // immediately on viewer connect (see startStreamingClean's onStatus) so the viewer isn't
+    // blank for up to a minute after joining.
+    private val batteryReportRunnable = object : Runnable {
+        override fun run() {
+            sendBatteryReport()
+            watchdogHandler.postDelayed(this, 60_000L)
+        }
+    }
+    private fun sendBatteryReport() {
+        val pct = lastBatteryPct
+        if (pct < 0) return
+        server?.enqueue(Protocol.buildBatteryPacket(pct, lastBatteryCharging))
     }
     private var wifiLock: WifiManager.WifiLock? = null
     @Volatile private var codecConfig: ByteArray? = null
@@ -476,6 +498,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     statusText.text = if (connected) "Viewer connected" else msg
                     statusText.setTextColor(if (connected) 0xFF00FF00.toInt() else 0xFFFFFFFF.toInt())
                     notConnectedBanner.visibility = if (connected) View.GONE else View.VISIBLE
+                    if (connected) sendBatteryReport()  // don't leave the viewer blank for up to a minute
                 }
             },
             onFormatSelect     = { idx -> onFormatSelected(idx) },
@@ -493,6 +516,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         ).also { it.start() }
         registerMdns()
         watchdogHandler.postDelayed(watchdogRunnable, 3_000L)
+        watchdogHandler.postDelayed(batteryReportRunnable, 60_000L)
         registerNetworkListener()
     }
 
@@ -502,6 +526,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         unregisterNetworkListener()
         watchdogHandler.removeCallbacks(watchdogRunnable)
         watchdogHandler.removeCallbacks(mdnsRefreshRunnable)
+        watchdogHandler.removeCallbacks(batteryReportRunnable)
         unregisterMdns()
         // Capture-then-null so a concurrent stop (orphan teardown + onDestroy) is a no-op.
         val e = encoder; encoder = null

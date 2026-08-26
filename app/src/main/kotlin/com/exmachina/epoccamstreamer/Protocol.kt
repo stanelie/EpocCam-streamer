@@ -89,6 +89,24 @@ object Protocol {
         return buf
     }
 
+    // Build a battery-status packet (type 0x00020006). Not part of the original iPhone/Android
+    // wire protocol — a receiver that doesn't recognize the type just logs and ignores it
+    // (Connection.swift's default case), so this can't break compatibility with anything.
+    // Payload: [0]=level 0-100, [1]=charging (0/1), [2-3]=reserved/pad.
+    fun buildBatteryPacket(levelPct: Int, charging: Boolean): ByteArray {
+        val payload = byteArrayOf(levelPct.coerceIn(0, 100).toByte(), if (charging) 1 else 0, 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x00020006)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
     private fun putLE32(buf: ByteArray, offset: Int, value: Int) {
         buf[offset]     = (value and 0xFF).toByte()
         buf[offset + 1] = ((value shr 8) and 0xFF).toByte()
