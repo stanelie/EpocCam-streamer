@@ -167,6 +167,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         server?.enqueue(Protocol.buildBatteryPacket(pct, lastBatteryCharging))
     }
     private var wifiLock: WifiManager.WifiLock? = null
+    // Held while streaming so the Wi-Fi driver stops filtering inbound broadcast frames.
+    // ARP requests are broadcast, so without this a viewer with no cached ARP entry for us
+    // can stall for seconds before its TCP SYN goes anywhere — even though this phone is
+    // wide awake with the screen on. (WIFI_MODE_FULL_HIGH_PERF above doesn't cover this,
+    // and is a no-op on API 29+ anyway.)
+    private var multicastLock: WifiManager.MulticastLock? = null
     @Volatile private var codecConfig: ByteArray? = null
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -508,6 +514,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         startForegroundService(Intent(this, StreamingService::class.java))
         val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "epoccam_stream").also { it.acquire() }
+        multicastLock = wm.createMulticastLock("epoccam_multicast").also {
+            it.setReferenceCounted(false)
+            it.acquire()
+            Log.w(TAG, "multicast lock acquired (held=${it.isHeld})")
+        }
         val capPkt = Protocol.buildCapabilityPacket()
         server = StreamingServer(
             onStatus = { msg ->
@@ -550,9 +561,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val e = encoder; encoder = null
         val s = server;  server  = null
         val w = wifiLock; wifiLock = null
+        val ml = multicastLock; multicastLock = null
         e?.stop()    // blocks until the camera HAL confirms close (frees it for the next start)
         s?.stop()
         try { w?.release() } catch (_: Exception) {}
+        try { ml?.release() } catch (_: Exception) {}
     }
 
     private fun onNalUnit(data: ByteArray, offset: Int, size: Int, isSps: Boolean) {
