@@ -34,7 +34,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "MainActivity"
 private const val NSD_TYPE  = "_epoccam._tcp"
-private const val NSD_TYPE2 = "_epoccamsvc._tcp"
 private const val LISTEN_PORT = 5054
 
 // Must match the formats advertised in Protocol.buildCapabilityPacket(): index 0=HD, index 1=SD.
@@ -96,9 +95,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var encoder: CameraEncoder? = null
     private var nsdManager: NsdManager? = null
     private var nsdRegistered  = false
-    private var nsdRegistered2 = false
     private var nsdListener1: NsdManager.RegistrationListener? = null
-    private var nsdListener2: NsdManager.RegistrationListener? = null
     // The IPv4 currently baked into the mDNS "ip" TXT. Tracked so we can re-advertise
     // when the phone's address changes (e.g. Wi-Fi roam) — otherwise the viewer keeps
     // dialing a stale address and can never reconnect.
@@ -370,18 +367,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }, "epoc-encoder-heal").start()
     }
 
-    private fun makeMdnsListener(slot: Int) = object : NsdManager.RegistrationListener {
+    private fun makeMdnsListener() = object : NsdManager.RegistrationListener {
         override fun onServiceRegistered(si: NsdServiceInfo) {
-            Log.w(TAG, "mDNS slot$slot registered: ${si.serviceType}")
-            if (slot == 1) { nsdRegistered = true; runOnUiThread { statusText.text = "Waiting for viewer…" } }
-            else nsdRegistered2 = true
+            Log.w(TAG, "mDNS registered: ${si.serviceType}")
+            nsdRegistered = true
+            runOnUiThread { statusText.text = "Waiting for viewer…" }
         }
-        override fun onRegistrationFailed(si: NsdServiceInfo, err: Int) { Log.e(TAG, "mDNS slot$slot registration failed: $err") }
+        override fun onRegistrationFailed(si: NsdServiceInfo, err: Int) { Log.e(TAG, "mDNS registration failed: $err") }
         override fun onServiceUnregistered(si: NsdServiceInfo) {
-            Log.w(TAG, "mDNS slot$slot unregistered: ${si.serviceType}")
-            if (slot == 1) nsdRegistered = false else nsdRegistered2 = false
+            Log.w(TAG, "mDNS unregistered: ${si.serviceType}")
+            nsdRegistered = false
         }
-        override fun onUnregistrationFailed(si: NsdServiceInfo, err: Int) { Log.e(TAG, "mDNS slot$slot unregistration failed: $err") }
+        override fun onUnregistrationFailed(si: NsdServiceInfo, err: Int) { Log.e(TAG, "mDNS unregistration failed: $err") }
     }
 
     // First non-loopback IPv4 (wlan0). Advertised in TXT so the viewer connects to
@@ -411,11 +408,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val mgr = getSystemService(NSD_SERVICE) as NsdManager
         nsdManager = mgr
         advertisedIp = localIpv4()   // freeze the address we're about to advertise
-        nsdListener1 = makeMdnsListener(1).also { listener ->
-            mgr.registerService(mdnsServiceInfo(NSD_TYPE),  NsdManager.PROTOCOL_DNS_SD, listener)
-        }
-        nsdListener2 = makeMdnsListener(2).also { listener ->
-            mgr.registerService(mdnsServiceInfo(NSD_TYPE2), NsdManager.PROTOCOL_DNS_SD, listener)
+        nsdListener1 = makeMdnsListener().also { listener ->
+            mgr.registerService(mdnsServiceInfo(NSD_TYPE), NsdManager.PROTOCOL_DNS_SD, listener)
         }
     }
 
@@ -438,9 +432,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun unregisterMdns() {
         val mgr = nsdManager ?: return
-        if (nsdRegistered)  try { nsdListener1?.let { mgr.unregisterService(it) } } catch (_: Exception) {}
-        if (nsdRegistered2) try { nsdListener2?.let { mgr.unregisterService(it) } } catch (_: Exception) {}
-        nsdRegistered = false; nsdRegistered2 = false
+        if (nsdRegistered) try { nsdListener1?.let { mgr.unregisterService(it) } } catch (_: Exception) {}
+        nsdRegistered = false
     }
 
     private fun registerNetworkListener() {
