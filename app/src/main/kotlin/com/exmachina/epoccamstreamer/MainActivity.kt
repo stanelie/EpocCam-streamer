@@ -34,6 +34,13 @@ private const val TAG = "MainActivity"
 private const val NSD_TYPE  = "_epoccam._tcp"
 private const val LISTEN_PORT = 5054
 
+// Focus button labels. Two lines each so the wording fits the existing 128x72dp button
+// without resizing it; short enough not to ellipsize at 18sp.
+private const val FOCUS_AUTO    = "auto\nfocus"
+private const val FOCUS_MANUAL  = "manual\nfocus"
+private const val FOCUS_BUSY    = "focusing\n…"
+private const val FOCUS_UNSURE  = "manual\nfocus?"   // AF never reported a lock
+
 // Must match the formats advertised in Protocol.buildCapabilityPacket(): index 0=HD, index 1=SD.
 private val FORMATS  = listOf(Pair(1280, 720), Pair(640, 480))
 // Bitrates from Android 1.13 smali: h.c=0x3567E0 for 1280×720, h.c=0x2625A0 for 720×480 (SD).
@@ -220,7 +227,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 // onDone never called and focusInProgress stuck.
                 focusInProgress = false
                 focusTimeoutHandler.removeCallbacksAndMessages(null)
-                focusModeButton.text = "AF"
+                focusModeButton.text = FOCUS_AUTO
                 encoder?.setContinuousAf()
             }
         }
@@ -250,7 +257,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (focusInProgress) return  // ignore a retap while the previous attempt is still converging
         val enc = encoder ?: return
         focusInProgress = true
-        focusModeButton.text = "..."
+        focusModeButton.text = FOCUS_BUSY
         // Safety net: if the camera never reports a final AF state (edge case — see
         // CameraEncoder.triggerAfAndLock), don't leave focus permanently stuck ignoring taps.
         focusTimeoutHandler.postDelayed({ finishFocus(focused = false) }, 4_000L)
@@ -261,7 +268,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (!focusInProgress) return  // already finished (e.g. the timeout fired after the real callback)
         focusInProgress = false
         focusTimeoutHandler.removeCallbacksAndMessages(null)
-        focusModeButton.text = if (focused) "MF" else "MF?"
+        focusModeButton.text = if (focused) FOCUS_MANUAL else FOCUS_UNSURE
     }
 
     override fun onRequestPermissionsResult(req: Int, perms: Array<String>, results: IntArray) {

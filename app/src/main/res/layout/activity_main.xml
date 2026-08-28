@@ -63,10 +63,12 @@
             android:id="@+id/focusModeButton"
             android:layout_width="128dp"
             android:layout_height="72dp"
-            android:text="AF"
+            android:text="auto\nfocus"
             android:textSize="18sp"
             android:textColor="#FFFFFF"
             android:backgroundTint="#80000000"
+            android:maxLines="2"
+            android:gravity="center"
             android:padding="0dp" />
 
     </LinearLayout>
