@@ -53,8 +53,13 @@ class CameraEncoder(
     private val cameraThread = HandlerThread("epoc-camera").also { it.start() }
     private val cameraHandler = Handler(cameraThread.looper)
 
+    @Volatile private var hasFlash = false
     private val drainThread = Thread({ drainLoop() }, "epoc-drain")
     @Volatile private var nalLogCount = 0
+
+    // Camera LED (torch), driven from the viewer. Applied through the repeating request
+    // rather than CameraManager.setTorchMode(), which is not usable while we own the camera.
+    @Volatile private var torchOn = false
 
     // AF state
     @Volatile private var currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
@@ -82,6 +87,9 @@ class CameraEncoder(
                 .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         } ?: manager.cameraIdList[0]
         Log.w(TAG, "camera=$cameraId")
+        hasFlash = manager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        Log.w(TAG, "flash unit available: $hasFlash")
 
         val allCodecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
         allCodecs.filter { it.isEncoder && it.supportedTypes.any { t -> t == "video/avc" } }
@@ -205,6 +213,11 @@ class CameraEncoder(
         preview?.let { addTarget(it) }
         addTarget(enc)
         set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        // AE_MODE_ON (rather than an ON_AUTO_FLASH variant) is required for FLASH_MODE to be
+        // honoured — the auto-flash modes drive the LED themselves and ignore it.
+        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        set(CaptureRequest.FLASH_MODE,
+            if (torchOn) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
         set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
         // TEMPLATE_RECORD is documented to disable ZSL, but some HALs (notably Pixel's) still
         // run a ring-buffer/multi-frame pipeline on the record output. Explicit belt-and-braces.
@@ -259,6 +272,23 @@ class CameraEncoder(
         captureSession = null
         startCapture(cam)
         if (holder != null) requestIDR()
+    }
+
+    // Toggle the camera LED. No-op on a camera with no flash unit, which is reported so the
+    // operator can tell "the phone ignored me" from "the message never arrived".
+    fun setTorch(on: Boolean) {
+        val cam = cameraDevice ?: run { Log.w(TAG, "setTorch: no cameraDevice, ignored"); return }
+        val session = captureSession ?: run { Log.w(TAG, "setTorch: no captureSession, ignored"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "setTorch: no captureSurface, ignored"); return }
+        if (!hasFlash) { Log.w(TAG, "setTorch: this camera has no flash unit, ignored"); return }
+        torchOn = on
+        val preview = previewHolder?.surface
+        try {
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, currentAfApiMode), captureCallback, cameraHandler
+            )
+            Log.w(TAG, "torch ${if (on) "ON" else "OFF"}")
+        } catch (e: Exception) { Log.e(TAG, "setTorch failed: $e") }
     }
 
     fun setContinuousAf() {

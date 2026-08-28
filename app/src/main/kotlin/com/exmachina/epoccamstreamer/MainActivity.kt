@@ -546,6 +546,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 }
             },
             onFormatSelect     = { idx -> onFormatSelected(idx) },
+            onTorch            = { on -> encoder?.setTorch(on) },
             onViewerDisconnect = { onViewerDisconnected() },
             capabilityPacket   = capPkt
         ).also { it.start() }

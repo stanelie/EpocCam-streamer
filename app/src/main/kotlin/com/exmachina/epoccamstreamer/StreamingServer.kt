@@ -15,6 +15,7 @@ private const val MAX_QUEUE = 60
 class StreamingServer(
     private val onStatus: (String) -> Unit,
     private val onFormatSelect: (Int) -> Unit = {},
+    private val onTorch: (Boolean) -> Unit = {},
     private val onViewerDisconnect: () -> Unit = {},
     var capabilityPacket: ByteArray? = null
 ) {
@@ -133,6 +134,10 @@ class StreamingServer(
                                 val idx = (rxBuf[16].toInt() and 0xFF) or ((rxBuf[17].toInt() and 0xFF) shl 8)
                                 Log.w(TAG, "format-select idx=$idx")
                                 onFormatSelect(idx)
+                            } else if (type == 0x00020007) {
+                                val on = rxBuf[16].toInt() != 0
+                                Log.w(TAG, "torch request: ${if (on) "ON" else "OFF"}")
+                                onTorch(on)
                             } else {
                                 Log.w(TAG, "viewer packet type=0x${"%08x".format(type)}")
                             }
