@@ -38,4 +38,9 @@ android {
 dependencies {
     implementation 'androidx.core:core-ktx:1.9.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
+    // Pure-Java mDNS responder. Replaces android.net.nsd.NsdManager, whose daemon was
+    // measured registering this service in 2s, 73s and 109s on the same phone with
+    // identical code — and which cannot be safely forced (rapid re-registration wedges it
+    // outright). JmDNS keeps registration in-process where we control it.
+    implementation 'org.jmdns:jmdns:3.5.9'
 }

@@ -13,8 +13,6 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
@@ -93,9 +91,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var pinningConfirmed = false
     private var server: StreamingServer? = null
     @Volatile private var encoder: CameraEncoder? = null
-    private var nsdManager: NsdManager? = null
-    private var nsdRegistered  = false
-    private var nsdListener1: NsdManager.RegistrationListener? = null
+    // mDNS is served in-process by JmDNS rather than android.net.nsd.NsdManager. The system
+    // daemon was measured registering this service in 2s, 73s and 109s on the same phone with
+    // identical code, and cannot be forced: keying a retry off onServiceRegistered() fails
+    // because that callback does not fire reliably even when the record *is* on the wire, and
+    // rapid re-registration wedges the daemon outright (nothing advertises until Wi-Fi is
+    // toggled). JmDNS keeps registration where we can see and control it.
+    @Volatile private var jmdns: javax.jmdns.JmDNS? = null
+    @Volatile private var mdnsRegistered = false
+    // JmDNS.create() and registerService() block on network I/O (mDNS probing), and close()
+    // can take seconds — all of it must stay off the main thread. Single-threaded so
+    // register/unregister can never interleave.
+    private val mdnsExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "epoc-mdns").apply { isDaemon = true }
+    }
     // The IPv4 currently baked into the mDNS "ip" TXT. Tracked so we can re-advertise
     // when the phone's address changes (e.g. Wi-Fi roam) — otherwise the viewer keeps
     // dialing a stale address and can never reconnect.
@@ -373,19 +382,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }, "epoc-encoder-heal").start()
     }
 
-    private fun makeMdnsListener() = object : NsdManager.RegistrationListener {
-        override fun onServiceRegistered(si: NsdServiceInfo) {
-            Log.w(TAG, "mDNS registered: ${si.serviceType}")
-            nsdRegistered = true
-            runOnUiThread { statusText.text = "Waiting for viewer…" }
-        }
-        override fun onRegistrationFailed(si: NsdServiceInfo, err: Int) { Log.e(TAG, "mDNS registration failed: $err") }
-        override fun onServiceUnregistered(si: NsdServiceInfo) {
-            Log.w(TAG, "mDNS unregistered: ${si.serviceType}")
-            nsdRegistered = false
-        }
-        override fun onUnregistrationFailed(si: NsdServiceInfo, err: Int) { Log.e(TAG, "mDNS unregistration failed: $err") }
-    }
 
     // First non-loopback IPv4 (wlan0). Advertised in TXT so the viewer connects to
     // this exact phone, sidestepping the shared "Android.local" hostname that two
@@ -400,22 +396,33 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } catch (_: Exception) { null }
     }
 
-    private fun mdnsServiceInfo(type: String) = NsdServiceInfo().apply {
-        // Unique instance name (short id) so both phones are discoverable; the full "id"
-        // TXT is the stable slot key; "ip" TXT is the current address to dial.
-        serviceName = "mobile-${deviceId.take(8)}"
-        serviceType = type
-        port = LISTEN_PORT
-        setAttribute("id", deviceId)
-        advertisedIp?.let { setAttribute("ip", it) }
-    }
 
     private fun registerMdns() {
-        val mgr = getSystemService(NSD_SERVICE) as NsdManager
-        nsdManager = mgr
-        advertisedIp = localIpv4()   // freeze the address we're about to advertise
-        nsdListener1 = makeMdnsListener().also { listener ->
-            mgr.registerService(mdnsServiceInfo(NSD_TYPE), NsdManager.PROTOCOL_DNS_SD, listener)
+        val ip = localIpv4()         // freeze the address we're about to advertise
+        advertisedIp = ip
+        val name = "mobile-${deviceId.take(8)}"
+        mdnsExecutor.execute {
+            closeJmdns()             // never run two responders at once
+            if (ip == null) { Log.w(TAG, "mDNS: no IPv4 address yet — will retry on network change"); return@execute }
+            try {
+                // Bind to this interface explicitly; letting JmDNS pick can land it on a
+                // virtual/secondary interface the viewer isn't on.
+                val jm = javax.jmdns.JmDNS.create(java.net.InetAddress.getByName(ip), name)
+                // Unique instance name (short id) so both phones are discoverable; the full
+                // "id" TXT is the stable slot key; "ip" TXT is the current address to dial.
+                val info = javax.jmdns.ServiceInfo.create(
+                    "$NSD_TYPE.local.", name, LISTEN_PORT, 0, 0,
+                    hashMapOf("id" to deviceId, "ip" to ip)
+                )
+                jm.registerService(info)
+                jmdns = jm
+                mdnsRegistered = true
+                Log.w(TAG, "mDNS registered via JmDNS: $name on $ip")
+                runOnUiThread { if (server != null && !locked) statusText.text = "Waiting for viewer…" }
+            } catch (e: Exception) {
+                mdnsRegistered = false
+                Log.e(TAG, "mDNS register failed: $e")
+            }
         }
     }
 
@@ -437,9 +444,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun unregisterMdns() {
-        val mgr = nsdManager ?: return
-        if (nsdRegistered) try { nsdListener1?.let { mgr.unregisterService(it) } } catch (_: Exception) {}
-        nsdRegistered = false
+        mdnsExecutor.execute { closeJmdns() }
+    }
+
+    // Always called on mdnsExecutor.
+    private fun closeJmdns() {
+        val jm = jmdns ?: return
+        jmdns = null
+        mdnsRegistered = false
+        try { jm.unregisterAllServices() } catch (_: Exception) {}
+        try { jm.close() } catch (_: Exception) {}
+        Log.w(TAG, "mDNS unregistered (JmDNS closed)")
     }
 
     private fun registerNetworkListener() {
