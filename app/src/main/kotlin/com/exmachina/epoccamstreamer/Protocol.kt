@@ -107,6 +107,23 @@ object Protocol {
         return buf
     }
 
+    // Build a focus-state packet (type 0x00020009, phone -> viewer) so the viewer's focus
+    // button can mirror this phone rather than guess. Payload: [0]=state, [1-3]=pad.
+    // States match FOCUS_STATE_* in MainActivity: 0=auto 1=manual 2=focusing 3=manual-unsure.
+    fun buildFocusStatePacket(state: Int): ByteArray {
+        val payload = byteArrayOf(state.toByte(), 0, 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x00020009)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
     private fun putLE32(buf: ByteArray, offset: Int, value: Int) {
         buf[offset]     = (value and 0xFF).toByte()
         buf[offset + 1] = ((value shr 8) and 0xFF).toByte()

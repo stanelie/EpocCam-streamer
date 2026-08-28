@@ -41,6 +41,18 @@ private const val FOCUS_MANUAL  = "manual\nfocus"
 private const val FOCUS_BUSY    = "focusing\n…"
 private const val FOCUS_UNSURE  = "manual\nfocus?"   // AF never reported a lock
 
+// Focus state, mirrored to the viewer so its button shows what this phone is actually
+// doing rather than what it last asked for. Must stay in sync with the viewer's FocusState.
+private const val FOCUS_STATE_AUTO   = 0
+private const val FOCUS_STATE_MANUAL = 1
+private const val FOCUS_STATE_BUSY   = 2
+private const val FOCUS_STATE_UNSURE = 3
+
+// Focus commands accepted from the viewer.
+private const val FOCUS_CMD_AUTO    = 0
+private const val FOCUS_CMD_MANUAL  = 1
+private const val FOCUS_CMD_REFOCUS = 2
+
 // Must match the formats advertised in Protocol.buildCapabilityPacket(): index 0=HD, index 1=SD.
 private val FORMATS  = listOf(Pair(1280, 720), Pair(640, 480))
 // Bitrates from Android 1.13 smali: h.c=0x3567E0 for 1280×720, h.c=0x2625A0 for 720×480 (SD).
@@ -93,6 +105,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // the in-flight attempt), so focus can appear to never lock and the button text flickers as
     // separate attempts' callbacks land out of order.
     @Volatile private var focusInProgress = false
+    @Volatile private var focusState = FOCUS_STATE_AUTO
     private val focusTimeoutHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var locked = false
     private var pinningConfirmed = false
@@ -215,20 +228,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         focusModeButton = findViewById(R.id.focusModeButton)
         focusModeButton.setOnClickListener {
-            tapFocusMode = !tapFocusMode
             if (tapFocusMode) {
+                applyAutoFocus()
+            } else {
                 // Lock focus immediately — don't wait for a separate screen tap. A later tap
                 // (while already in MF mode) re-locks at that point via the same path.
+                tapFocusMode = true
                 triggerFocus()
-            } else {
-                // Cancel any in-flight tap-focus attempt so its timeout can't later overwrite
-                // this "AF" with a stale "MF?" — encoder.setContinuousAf() already clears the
-                // camera-side AF listener, which would otherwise leave triggerAfAndLock's
-                // onDone never called and focusInProgress stuck.
-                focusInProgress = false
-                focusTimeoutHandler.removeCallbacksAndMessages(null)
-                focusModeButton.text = FOCUS_AUTO
-                encoder?.setContinuousAf()
             }
         }
 
@@ -253,11 +259,51 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    // Single place that changes focus state: updates this phone's button and reports to the
+    // viewer, so the two can't drift apart.
+    private fun setFocusState(state: Int) {
+        focusState = state
+        focusModeButton.text = when (state) {
+            FOCUS_STATE_AUTO   -> FOCUS_AUTO
+            FOCUS_STATE_MANUAL -> FOCUS_MANUAL
+            FOCUS_STATE_BUSY   -> FOCUS_BUSY
+            else               -> FOCUS_UNSURE
+        }
+        sendFocusState()
+    }
+
+    private fun sendFocusState() {
+        server?.enqueue(Protocol.buildFocusStatePacket(focusState))
+    }
+
+    // Focus commands from the viewer. Touches the UI and the encoder, so it runs on the
+    // main thread rather than the socket's receive thread.
+    private fun onFocusCommandFromViewer(cmd: Int) = runOnUiThread {
+        when (cmd) {
+            FOCUS_CMD_AUTO    -> if (tapFocusMode) applyAutoFocus()
+            FOCUS_CMD_MANUAL  -> if (!tapFocusMode) { tapFocusMode = true; triggerFocus() }
+            FOCUS_CMD_REFOCUS -> if (tapFocusMode) triggerFocus()
+            else -> Log.w(TAG, "unknown focus command $cmd")
+        }
+    }
+
+    // Back to continuous AF. Cancels any in-flight tap-focus attempt so its timeout can't
+    // later overwrite this with a stale "manual focus?" — setContinuousAf() clears the
+    // camera-side AF listener, which would otherwise leave triggerAfAndLock's onDone
+    // never called and focusInProgress stuck.
+    private fun applyAutoFocus() {
+        tapFocusMode = false
+        focusInProgress = false
+        focusTimeoutHandler.removeCallbacksAndMessages(null)
+        setFocusState(FOCUS_STATE_AUTO)
+        encoder?.setContinuousAf()
+    }
+
     private fun triggerFocus() {
         if (focusInProgress) return  // ignore a retap while the previous attempt is still converging
         val enc = encoder ?: return
         focusInProgress = true
-        focusModeButton.text = FOCUS_BUSY
+        setFocusState(FOCUS_STATE_BUSY)
         // Safety net: if the camera never reports a final AF state (edge case — see
         // CameraEncoder.triggerAfAndLock), don't leave focus permanently stuck ignoring taps.
         focusTimeoutHandler.postDelayed({ finishFocus(focused = false) }, 4_000L)
@@ -268,7 +314,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (!focusInProgress) return  // already finished (e.g. the timeout fired after the real callback)
         focusInProgress = false
         focusTimeoutHandler.removeCallbacksAndMessages(null)
-        focusModeButton.text = if (focused) FOCUS_MANUAL else FOCUS_UNSURE
+        setFocusState(if (focused) FOCUS_STATE_MANUAL else FOCUS_STATE_UNSURE)
     }
 
     override fun onRequestPermissionsResult(req: Int, perms: Array<String>, results: IntArray) {
@@ -549,11 +595,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     statusText.text = if (connected) "Viewer connected" else msg
                     statusText.setTextColor(if (connected) 0xFF00FF00.toInt() else 0xFFFFFFFF.toInt())
                     notConnectedBanner.visibility = if (connected) View.GONE else View.VISIBLE
-                    if (connected) sendBatteryReport()  // don't leave the viewer blank for up to a minute
+                    if (connected) {
+                        sendBatteryReport()   // don't leave the viewer blank for up to a minute
+                        sendFocusState()      // so the viewer's focus button starts in sync
+                    }
                 }
             },
             onFormatSelect     = { idx -> onFormatSelected(idx) },
             onTorch            = { on -> encoder?.setTorch(on) },
+            onFocusCommand     = { cmd -> onFocusCommandFromViewer(cmd) },
             onViewerDisconnect = { onViewerDisconnected() },
             capabilityPacket   = capPkt
         ).also { it.start() }
