@@ -25,6 +25,13 @@ import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "CameraEncoder"
 
+// The two frame rates the viewer can pick between. 60 measured ~33ms (one 30fps frame
+// interval) off end-to-end latency on a Pixel 5 at 720p, at the cost of halving per-frame
+// quality for the same CBR bitrate — worth it for some material and not others, hence a
+// per-camera setting rather than a hardcoded rate.
+const val DEFAULT_FPS = 30
+const val HIGH_FPS = 60
+
 class CameraEncoder(
     private val context: Context,
     @Volatile var previewHolder: SurfaceHolder?,
@@ -66,6 +73,14 @@ class CameraEncoder(
     @Volatile var hasEIS = false; private set
     @Volatile private var eisOn = initialEIS
     val eisEnabled: Boolean get() = eisOn
+    // Not every camera can sustain 60fps, and CONTROL_AE_TARGET_FPS_RANGE only accepts a
+    // range the HAL actually advertises — asking for one it doesn't list fails session
+    // configuration outright (a black preview, the failure mode we already fight on the
+    // older Exynos phones). So the request is clamped to what this device really offers and
+    // the viewer is told the rate it actually got, rather than the one it asked for.
+    @Volatile var supportsHighFps = false; private set
+    @Volatile var activeFps = fps; private set
+    private var fpsRange: android.util.Range<Int> = android.util.Range(fps, fps)
     private val drainThread = Thread({ drainLoop() }, "epoc-drain")
     @Volatile private var nalLogCount = 0
 
@@ -119,7 +134,15 @@ class CameraEncoder(
             ?.any { it == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON } == true
         hasEIS = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
             ?.any { it == CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON } == true
-        Log.w(TAG, "flash=$hasFlash OIS=$hasOIS EIS=$hasEIS")
+        val aeRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        supportsHighFps = pickFpsRange(aeRanges, HIGH_FPS) != null
+        // Fall back rather than fail: a phone that can't do the requested rate still streams.
+        val wanted = if (fps >= HIGH_FPS && !supportsHighFps) DEFAULT_FPS else fps
+        fpsRange = pickFpsRange(aeRanges, wanted) ?: android.util.Range(wanted, wanted)
+        activeFps = fpsRange.upper
+        Log.w(TAG, "flash=$hasFlash OIS=$hasOIS EIS=$hasEIS " +
+                   "fps=$activeFps range=$fpsRange high60=$supportsHighFps " +
+                   "advertised=${aeRanges?.joinToString()}")
 
         val allCodecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
         allCodecs.filter { it.isEncoder && it.supportedTypes.any { t -> t == "video/avc" } }
@@ -127,7 +150,7 @@ class CameraEncoder(
 
         val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_FRAME_RATE, activeFps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // auto keyframe every 1s: instant viewer join + loss recovery
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
@@ -243,6 +266,17 @@ class CameraEncoder(
         }, cameraHandler)
     }
 
+    // Pick an advertised AE range that delivers `target`. A fixed [t,t] range is preferred:
+    // it stops AE from dropping the rate (and lengthening exposure) in dim light, which is
+    // both a latency and a smoothness cost. Falls back to any range topping out at the
+    // target, then gives up so the caller can clamp.
+    private fun pickFpsRange(ranges: Array<android.util.Range<Int>>?, target: Int)
+            : android.util.Range<Int>? {
+        if (ranges == null) return null
+        return ranges.firstOrNull { it.lower == target && it.upper == target }
+            ?: ranges.filter { it.upper == target }.minByOrNull { it.lower }
+    }
+
     private fun buildRequest(
         camera: CameraDevice,
         preview: Surface?,
@@ -258,7 +292,7 @@ class CameraEncoder(
         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         set(CaptureRequest.FLASH_MODE,
             if (torchOn) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
-        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(fps, fps))
+        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
         // TEMPLATE_RECORD is documented to disable ZSL, but some HALs (notably Pixel's) still
         // run a ring-buffer/multi-frame pipeline on the record output. Explicit belt-and-braces.
         set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
@@ -293,10 +327,19 @@ class CameraEncoder(
                         buildRequest(camera, preview, enc, currentAfApiMode),
                         captureCallback, cameraHandler
                     )
-                } catch (e: IllegalStateException) {
-                    // Session was superseded by a newer createCaptureSession call before
-                    // this onConfigured callback fired. The newer session will take over.
-                    Log.w(TAG, "onConfigured: session already closed, superseded: $e")
+                } catch (e: Exception) {
+                    // Two distinct races, both benign, both fatal if they escape: this
+                    // callback runs on the camera thread, so an uncaught throw here kills the
+                    // process. IllegalStateException = the session was superseded by a newer
+                    // createCaptureSession before this callback fired (the newer one takes
+                    // over). CameraAccessException(CAMERA_DISCONNECTED) = the device was
+                    // closed while the configuration was in flight — buildRequest() calls
+                    // createCaptureRequest() on it, which throws once it is no longer alive.
+                    // That happens routinely when an encoder rebuild or an app stop lands
+                    // mid-configure. Every other buildRequest() call site in this file already
+                    // catches broadly; this one did not.
+                    Log.w(TAG, "onConfigured: camera gone or session superseded: $e")
+                    try { session.close() } catch (_: Exception) {}
                 }
             }
             override fun onConfigureFailed(session: CameraCaptureSession) {

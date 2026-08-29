@@ -145,7 +145,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    private val fps = 30
+    // Driven from the viewer (and persisted there, like the resolution and EIS choices) —
+    // survives encoder rebuilds so a resolution change doesn't silently drop back to 30.
+    @Volatile private var desiredFps = DEFAULT_FPS
 
     // Default to SD (format index 1 = 640×480); switched to HD on viewer request.
     @Volatile private var currentFmt = 1
@@ -288,6 +290,40 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             oisSupported = e.hasOIS, oisOn = e.hasOIS))
     }
 
+    // Frame-rate capability + what the encoder actually settled on. The phone may clamp a
+    // 60fps request (see CameraEncoder.pickFpsRange), so the viewer is told the real rate
+    // rather than assuming its request was honoured.
+    private fun sendFpsState() {
+        val e = encoder ?: return
+        server?.enqueue(Protocol.buildFpsStatePacket(e.activeFps, e.supportsHighFps))
+    }
+
+    // Frame-rate change from the viewer. MediaCodec's frame rate and the camera's AE target
+    // range are both fixed at construction, so this rebuilds the encoder exactly as a
+    // resolution change does — and, like that path, must not run on the main thread.
+    fun onFpsSelected(requested: Int) {
+        val want = if (requested >= HIGH_FPS) HIGH_FPS else DEFAULT_FPS
+        if (want == desiredFps && encoder != null) {
+            Log.w(TAG, "onFpsSelected: already at ${want}fps — reporting state only")
+            sendFpsState()
+            return
+        }
+        Log.w(TAG, "frame-rate change: ${desiredFps}fps → ${want}fps")
+        desiredFps = want
+        rebuildEncoderForFormat(currentFmt, geometryChanged = false)
+        // Settle on what the camera actually delivered, not what was asked for. A phone that
+        // can't do 60 clamps to 30 (see CameraEncoder.pickFpsRange); recording the request
+        // instead would leave desiredFps permanently disagreeing with the running encoder, so
+        // every later request for the rate it is *already* running would look like a change
+        // and rebuild the encoder again — on every reconnect, forever.
+        encoder?.let {
+            if (it.activeFps != desiredFps) {
+                Log.w(TAG, "frame rate clamped to ${it.activeFps}fps by the camera")
+                desiredFps = it.activeFps
+            }
+        }
+    }
+
     // Focus commands from the viewer. Touches the UI and the encoder, so it runs on the
     // main thread rather than the socket's receive thread.
     private fun onFocusCommandFromViewer(cmd: Int) = runOnUiThread {
@@ -378,38 +414,59 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } else {
             // Resolution change: close gate, flush stale frames, stop old encoder, start new one.
             Log.w(TAG, "resolution change: ${FORMATS[currentFmt].first}×${FORMATS[currentFmt].second} → ${FORMATS[fmt].first}×${FORMATS[fmt].second}")
-            formatSelected.set(false)
-            currentFmt = fmt
-            codecConfig = null
-            server?.flushQueue()
-            val old = encoder
-            encoder = null
-            Log.w(TAG, "stopping old encoder")
-            old?.stop()
-            Log.w(TAG, "old encoder stopped, starting new encoder ${FORMATS[fmt].first}×${FORMATS[fmt].second}")
-            encoder = CameraEncoder(
-                context       = this,
-                previewHolder = null,  // surfaceCreated will deliver it once aspect ratio resizes
-                width         = FORMATS[fmt].first,
-                height        = FORMATS[fmt].second,
-                fps           = fps,
-                bitrate       = BITRATES[fmt],
-                initialEIS    = desiredEIS,
-                onNalUnit     = ::onNalUnit
-            ).also { it.start() }
-            // A rebuild resets what the viewer knows: report the new encoder's capability and
-            // state, or the viewer's control stays stale (or briefly claims "unsupported",
-            // read off an encoder that was being torn down).
-            sendStabilizationState()
-            formatSelected.set(true)
-            Log.w(TAG, "new encoder started; posting aspect ratio update to main thread")
-            // Assign encoder BEFORE posting so the happens-before from Handler.post ensures
-            // the main thread sees the new encoder value when surfaceCreated fires.
-            runOnUiThread {
-                Log.w(TAG, "requestLayout: aspectRatio=${FORMATS[fmt].first}/${FORMATS[fmt].second}")
-                previewView.aspectRatio = FORMATS[fmt].first.toFloat() / FORMATS[fmt].second
-                previewView.requestLayout()
-            }
+            rebuildEncoderForFormat(fmt, geometryChanged = true)
+        }
+    }
+
+    // Tear down and rebuild the encoder at `fmt` and the current desiredFps. Shared by the
+    // resolution and frame-rate paths: both are fixed at CameraEncoder construction, so both
+    // need exactly this sequence (close the gate, drop stale frames, swap, reopen).
+    // `geometryChanged` is false for a frame-rate change, where the resolution is identical.
+    // It decides who hands the new encoder the preview surface: on a resolution change the
+    // view resizes, so surfaceChanged() fires and delivers it. On a same-size rebuild nothing
+    // resizes, surfaceChanged() never fires, and an encoder built with a null holder would
+    // leave the phone's own preview frozen on its last frame forever while the stream — a
+    // separate surface — carried on normally. So that case hands over the live holder here.
+    private fun rebuildEncoderForFormat(fmt: Int, geometryChanged: Boolean) {
+        formatSelected.set(false)
+        currentFmt = fmt
+        codecConfig = null
+        server?.flushQueue()
+        val old = encoder
+        encoder = null
+        Log.w(TAG, "stopping old encoder")
+        old?.stop()
+        Log.w(TAG, "old encoder stopped, starting new encoder ${FORMATS[fmt].first}×${FORMATS[fmt].second} @${desiredFps}fps")
+        val holder = if (geometryChanged) null
+                     else surfaceHolder.takeIf { it.surface?.isValid == true }
+        Log.w(TAG, "rebuild: geometryChanged=$geometryChanged preview=${if (holder != null) "attached" else "deferred"}")
+        encoder = CameraEncoder(
+            context       = this,
+            previewHolder = holder,  // null: surfaceChanged() will deliver it once the view resizes
+            width         = FORMATS[fmt].first,
+            height        = FORMATS[fmt].second,
+            fps           = desiredFps,
+            bitrate       = BITRATES[fmt],
+            initialEIS    = desiredEIS,
+            onNalUnit     = ::onNalUnit
+        ).also { it.start() }
+        // A rebuild resets what the viewer knows: report the new encoder's capability and
+        // state, or the viewer's control stays stale (or briefly claims "unsupported",
+        // read off an encoder that was being torn down).
+        sendStabilizationState()
+        sendFpsState()
+        formatSelected.set(true)
+        if (!geometryChanged) {
+            Log.w(TAG, "new encoder started (same geometry — no relayout needed)")
+            return
+        }
+        Log.w(TAG, "new encoder started; posting aspect ratio update to main thread")
+        // Assign encoder BEFORE posting so the happens-before from Handler.post ensures
+        // the main thread sees the new encoder value when surfaceCreated fires.
+        runOnUiThread {
+            Log.w(TAG, "requestLayout: aspectRatio=${FORMATS[fmt].first}/${FORMATS[fmt].second}")
+            previewView.aspectRatio = FORMATS[fmt].first.toFloat() / FORMATS[fmt].second
+            previewView.requestLayout()
         }
     }
 
@@ -437,16 +494,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     previewHolder = surfaceHolder.takeIf { it.surface?.isValid == true },
                     width         = FORMATS[fmt].first,
                     height        = FORMATS[fmt].second,
-                    fps           = fps,
+                    fps           = desiredFps,
                     bitrate       = BITRATES[fmt],
                     initialEIS    = desiredEIS,
                     onNalUnit     = ::onNalUnit
                 ).also { it.start() }
+                // A rebuild resets what the viewer knows: report the new encoder's capability
+                // and state, or the viewer's control stays stale (or briefly claims
+                // "unsupported", read off an encoder that was being torn down).
                 sendStabilizationState()
-            // A rebuild resets what the viewer knows: report the new encoder's capability and
-            // state, or the viewer's control stays stale (or briefly claims "unsupported",
-            // read off an encoder that was being torn down).
-            sendStabilizationState()
+                sendFpsState()
                 lastKeyframeMs = android.os.SystemClock.elapsedRealtime()
                 formatSelected.set(true)
                 Log.w(TAG, "SELF-HEAL: encoder recreated")
@@ -610,7 +667,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             it.acquire()
             Log.w(TAG, "multicast lock acquired (held=${it.isHeld})")
         }
-        val capPkt = Protocol.buildCapabilityPacket()
+        val capPkt = Protocol.buildCapabilityPacket(desiredFps)
         server = StreamingServer(
             onStatus = { msg ->
                 runOnUiThread {
@@ -622,10 +679,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         sendBatteryReport()   // don't leave the viewer blank for up to a minute
                         sendFocusState()      // so the viewer's focus button starts in sync
                         sendStabilizationState()
+                        sendFpsState()        // so the viewer's frame-rate menu starts in sync
                     }
                 }
             },
             onFormatSelect     = { idx -> onFormatSelected(idx) },
+            // Not runOnUiThread: this rebuilds the encoder, and CameraEncoder.stop() blocks
+            // on the camera close — on the main thread that freezes the preview on its last
+            // frame and stalls reconnect handling until the close finally returns. Runs on
+            // the socket's receive thread, exactly like the resolution change it mirrors.
+            onFpsSelect        = { f -> onFpsSelected(f) },
             onTorch            = { on -> encoder?.setTorch(on) },
             onFocusCommand     = { cmd -> onFocusCommandFromViewer(cmd) },
             onStabilization    = { on -> runOnUiThread {
@@ -638,7 +701,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             previewHolder = null,  // surfaceChanged delivers the holder once surface is ready
             width         = FORMATS[currentFmt].first,
             height        = FORMATS[currentFmt].second,
-            fps           = fps,
+            fps           = desiredFps,
             bitrate       = BITRATES[currentFmt],
             initialEIS    = desiredEIS,
             onNalUnit     = ::onNalUnit

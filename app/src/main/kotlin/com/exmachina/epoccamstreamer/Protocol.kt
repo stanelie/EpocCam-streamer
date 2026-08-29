@@ -61,7 +61,7 @@ object Protocol {
     //   bits 12-23: height (12 bits)
     //   bits 24-31: codec type (8 bits): 1=H.264
     //   bytes 4-7:  frame rate as float32 LE
-    fun buildCapabilityPacket(): ByteArray {
+    fun buildCapabilityPacket(fps: Int = DEFAULT_FPS): ByteArray {
         val total = 0x160           // 352 bytes, always fixed
         val dataSize = total - 28   // 324
         val buf = ByteArray(total)  // zero-filled
@@ -80,11 +80,11 @@ object Protocol {
 
         // Format 0: 1280×720, codec=1 (H.264), 30fps — marks us as HD device (no watermark)
         putLE32(buf, 32, (1 shl 24) or (720 shl 12) or 1280)  // 0x012D0500
-        putLE32(buf, 36, floatToIntBits(30.0f))                // 0x41F00000
+        putLE32(buf, 36, floatToIntBits(fps.toFloat()))
 
         // Format 1: 640×480, codec=1 (H.264), 30fps — what we actually stream at
         putLE32(buf, 40, (1 shl 24) or (480 shl 12) or 640)   // 0x011E0280
-        putLE32(buf, 44, floatToIntBits(30.0f))                // 0x41F00000
+        putLE32(buf, 44, floatToIntBits(fps.toFloat()))
 
         return buf
     }
@@ -137,6 +137,25 @@ object Protocol {
         putLE32(buf, 0,  0xDEADC0DE.toInt())
         putLE32(buf, 4,  0x00000000)
         putLE32(buf, 8,  0x0002000B)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
+    // Frame-rate state (type 0x0002000D, phone -> viewer). Like the stabilization packet,
+    // it carries capability alongside state: a camera that can't sustain 60 gets the option
+    // greyed out in the viewer instead of a control that silently falls back to 30.
+    // Payload: [0]=current fps [1]=highFpsSupported [2-3]=pad
+    fun buildFpsStatePacket(currentFps: Int, highFpsSupported: Boolean): ByteArray {
+        val payload = byteArrayOf(
+            currentFps.coerceIn(0, 255).toByte(), if (highFpsSupported) 1 else 0, 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x0002000D)
         putLE32(buf, 12, payload.size + 12)
         putLE32(buf, 16, 0)
         putLE32(buf, 20, 0)

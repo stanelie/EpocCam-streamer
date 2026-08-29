@@ -18,6 +18,7 @@ class StreamingServer(
     private val onTorch: (Boolean) -> Unit = {},
     private val onFocusCommand: (Int) -> Unit = {},
     private val onStabilization: (Boolean) -> Unit = {},
+    private val onFpsSelect: (Int) -> Unit = {},
     private val onViewerDisconnect: () -> Unit = {},
     var capabilityPacket: ByteArray? = null
 ) {
@@ -118,14 +119,20 @@ class StreamingServer(
             // is still null.
             onStatus("Viewer connected ($addr)")
 
-            val inp = sock.getInputStream()
+            // Every viewer->phone command is exactly 256 bytes, so read exactly that much
+            // and never straddle a boundary. A plain read() returns whatever TCP happens to
+            // have delivered: a split packet was parsed as though the missing fields were
+            // present, and its tail was then parsed as a fresh packet with a garbage type —
+            // silently losing a command. That got likelier once connect started sending
+            // three commands back to back (format, stabilization, frame rate).
+            val inp = java.io.DataInputStream(sock.getInputStream())
             val rxBuf = ByteArray(256)
             Thread({
                 try {
                     while (running.get()) {
-                        val n = inp.read(rxBuf)
-                        if (n < 0) break
-                        val hex = rxBuf.take(minOf(n, 64)).joinToString(" ") { "%02x".format(it) }
+                        inp.readFully(rxBuf, 0, rxBuf.size)
+                        val n = rxBuf.size
+                        val hex = rxBuf.take(64).joinToString(" ") { "%02x".format(it) }
                         Log.w(TAG, "viewer→phone ($n bytes): $hex")
                         if (n >= 12) {
                             val type = (rxBuf[8].toInt() and 0xFF) or
@@ -140,6 +147,10 @@ class StreamingServer(
                                 val on = rxBuf[16].toInt() != 0
                                 Log.w(TAG, "stabilization request: ${if (on) "ON" else "OFF"}")
                                 onStabilization(on)
+                            } else if (type == 0x0002000C) {
+                                val f = rxBuf[16].toInt() and 0xFF
+                                Log.w(TAG, "frame-rate request: ${f}fps")
+                                onFpsSelect(f)
                             } else if (type == 0x00020008) {
                                 val cmd = rxBuf[16].toInt() and 0xFF
                                 Log.w(TAG, "focus command: $cmd")
