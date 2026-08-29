@@ -74,12 +74,25 @@ class CameraEncoder(
     @Volatile private var currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
     private val afStateListener = AtomicReference<((Int) -> Unit)?>(null)
 
+    // Rate-limited: what the HAL *actually applied*, which is not necessarily what we asked
+    // for. A request for video stabilization can be silently ignored — the result is the only
+    // way to tell "the HAL refused" from "it is on but the effect is subtle".
+    @Volatile private var lastStabLogMs = 0L
+
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
             request: CaptureRequest,
             result: TotalCaptureResult
         ) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastStabLogMs > 3000) {
+                lastStabLogMs = now
+                Log.w(TAG, "APPLIED: videoStab=${result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)}" +
+                           " (requested=${request.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE)})" +
+                           " ois=${result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)}" +
+                           " (requested=${request.get(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE)})")
+            }
             val state = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
             afStateListener.get()?.invoke(state)
         }
@@ -170,8 +183,18 @@ class CameraEncoder(
                 // to the sensor/ISP/encode stages, not this queue. Kept at the safer 2 since 1
                 // bought nothing.
                 val writer = ImageWriter.newInstance(encSurface, 2, ImageFormat.PRIVATE)
+                // USAGE_VIDEO_ENCODE is required for electronic stabilization: the HAL only
+                // applies EIS to a stream marked for video encoding. It accepts the request
+                // either way (CaptureResult reports videoStab=1), but silently does nothing
+                // without this flag — no crop, no smoothing.
+                //
+                // Crucially this does NOT bring back the ~500ms Qualcomm stall. That bug is
+                // specific to MediaCodec.createInputSurface(), not to the usage flag: with the
+                // flag on this ImageReader, and the encoder still fed via ImageWriter,
+                // measured latency stays ~85ms while EIS works. Verified on a Pixel 5.
                 val reader = ImageReader.newInstance(
-                    width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+                    width, height, ImageFormat.PRIVATE, 2,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_VIDEO_ENCODE
                 )
                 reader.setOnImageAvailableListener({ r ->
                     val image: Image = try { r.acquireLatestImage() } catch (e: Exception) {
