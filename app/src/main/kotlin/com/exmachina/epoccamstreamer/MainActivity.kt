@@ -106,6 +106,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // separate attempts' callbacks land out of order.
     @Volatile private var focusInProgress = false
     @Volatile private var focusState = FOCUS_STATE_AUTO
+    // Survives encoder rebuilds: a resolution change constructs a new CameraEncoder, which
+    // would otherwise come up with stabilization off no matter what the viewer asked for.
+    @Volatile private var desiredEIS = false
     private val focusTimeoutHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var locked = false
     private var pinningConfirmed = false
@@ -391,8 +394,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 height        = FORMATS[fmt].second,
                 fps           = fps,
                 bitrate       = BITRATES[fmt],
+                initialEIS    = desiredEIS,
                 onNalUnit     = ::onNalUnit
             ).also { it.start() }
+            // A rebuild resets what the viewer knows: report the new encoder's capability and
+            // state, or the viewer's control stays stale (or briefly claims "unsupported",
+            // read off an encoder that was being torn down).
+            sendStabilizationState()
             formatSelected.set(true)
             Log.w(TAG, "new encoder started; posting aspect ratio update to main thread")
             // Assign encoder BEFORE posting so the happens-before from Handler.post ensures
@@ -431,8 +439,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     height        = FORMATS[fmt].second,
                     fps           = fps,
                     bitrate       = BITRATES[fmt],
+                    initialEIS    = desiredEIS,
                     onNalUnit     = ::onNalUnit
                 ).also { it.start() }
+                sendStabilizationState()
+            // A rebuild resets what the viewer knows: report the new encoder's capability and
+            // state, or the viewer's control stays stale (or briefly claims "unsupported",
+            // read off an encoder that was being torn down).
+            sendStabilizationState()
                 lastKeyframeMs = android.os.SystemClock.elapsedRealtime()
                 formatSelected.set(true)
                 Log.w(TAG, "SELF-HEAL: encoder recreated")
@@ -614,7 +628,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             onFormatSelect     = { idx -> onFormatSelected(idx) },
             onTorch            = { on -> encoder?.setTorch(on) },
             onFocusCommand     = { cmd -> onFocusCommandFromViewer(cmd) },
-            onStabilization    = { on -> runOnUiThread { encoder?.setEIS(on); sendStabilizationState() } },
+            onStabilization    = { on -> runOnUiThread {
+                desiredEIS = on; encoder?.setEIS(on); sendStabilizationState() } },
             onViewerDisconnect = { onViewerDisconnected() },
             capabilityPacket   = capPkt
         ).also { it.start() }
@@ -625,6 +640,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             height        = FORMATS[currentFmt].second,
             fps           = fps,
             bitrate       = BITRATES[currentFmt],
+            initialEIS    = desiredEIS,
             onNalUnit     = ::onNalUnit
         ).also { it.start() }
         registerMdns()

@@ -32,6 +32,9 @@ class CameraEncoder(
     private val height: Int,
     private val fps: Int,
     private val bitrate: Int,
+    // Carried across encoder rebuilds (a resolution change constructs a new CameraEncoder),
+    // so stabilization isn't silently lost whenever the format changes.
+    initialEIS: Boolean = false,
     private val onNalUnit: (data: ByteArray, offset: Int, size: Int, isSps: Boolean) -> Unit
 ) {
     private val running = AtomicBoolean(false)
@@ -61,7 +64,7 @@ class CameraEncoder(
     // motion — so it can cost real latency. Off by default and driven from the viewer so the
     // penalty can be measured rather than assumed.
     @Volatile var hasEIS = false; private set
-    @Volatile private var eisOn = false
+    @Volatile private var eisOn = initialEIS
     val eisEnabled: Boolean get() = eisOn
     private val drainThread = Thread({ drainLoop() }, "epoc-drain")
     @Volatile private var nalLogCount = 0
@@ -338,11 +341,14 @@ class CameraEncoder(
     // Electronic stabilization on/off. Re-issues the repeating request so it takes effect
     // immediately, the same way the torch does.
     fun setEIS(on: Boolean) {
-        if (!hasEIS) { Log.w(TAG, "setEIS: camera has no video stabilization, ignored"); return }
-        val cam = cameraDevice ?: run { Log.w(TAG, "setEIS: no cameraDevice, ignored"); return }
-        val session = captureSession ?: run { Log.w(TAG, "setEIS: no captureSession, ignored"); return }
-        val enc = captureSurface ?: run { Log.w(TAG, "setEIS: no captureSurface, ignored"); return }
+        // Record the intent first: a request can arrive before the capture session exists
+        // (the viewer re-applies the remembered setting the moment it connects), and
+        // buildRequest() will pick it up when the session does start.
         eisOn = on
+        if (!hasEIS) { Log.w(TAG, "setEIS: camera has no video stabilization, ignored"); return }
+        val cam = cameraDevice ?: run { Log.w(TAG, "setEIS: deferred until the session starts"); return }
+        val session = captureSession ?: run { Log.w(TAG, "setEIS: deferred until the session starts"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "setEIS: deferred until the session starts"); return }
         val preview = previewHolder?.surface
         try {
             session.setRepeatingRequest(
