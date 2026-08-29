@@ -17,6 +17,7 @@ class StreamingServer(
     private val onFormatSelect: (Int) -> Unit = {},
     private val onTorch: (Boolean) -> Unit = {},
     private val onFocusCommand: (Int) -> Unit = {},
+    private val onStabilization: (Boolean) -> Unit = {},
     private val onViewerDisconnect: () -> Unit = {},
     var capabilityPacket: ByteArray? = null
 ) {
@@ -135,6 +136,10 @@ class StreamingServer(
                                 val idx = (rxBuf[16].toInt() and 0xFF) or ((rxBuf[17].toInt() and 0xFF) shl 8)
                                 Log.w(TAG, "format-select idx=$idx")
                                 onFormatSelect(idx)
+                            } else if (type == 0x0002000A) {
+                                val on = rxBuf[16].toInt() != 0
+                                Log.w(TAG, "stabilization request: ${if (on) "ON" else "OFF"}")
+                                onStabilization(on)
                             } else if (type == 0x00020008) {
                                 val cmd = rxBuf[16].toInt() and 0xFF
                                 Log.w(TAG, "focus command: $cmd")

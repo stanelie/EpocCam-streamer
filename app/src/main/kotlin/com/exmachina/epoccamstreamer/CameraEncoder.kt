@@ -54,6 +54,15 @@ class CameraEncoder(
     private val cameraHandler = Handler(cameraThread.looper)
 
     @Volatile private var hasFlash = false
+    // Optical stabilization is free: it moves a lens element, so there is no crop and no
+    // frame buffering. Enabled whenever the camera offers it, with no toggle.
+    @Volatile var hasOIS = false; private set
+    // Electronic stabilization crops and, more importantly, buffers frames to look ahead at
+    // motion — so it can cost real latency. Off by default and driven from the viewer so the
+    // penalty can be measured rather than assumed.
+    @Volatile var hasEIS = false; private set
+    @Volatile private var eisOn = false
+    val eisEnabled: Boolean get() = eisOn
     private val drainThread = Thread({ drainLoop() }, "epoc-drain")
     @Volatile private var nalLogCount = 0
 
@@ -87,9 +96,14 @@ class CameraEncoder(
                 .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         } ?: manager.cameraIdList[0]
         Log.w(TAG, "camera=$cameraId")
-        hasFlash = manager.getCameraCharacteristics(cameraId)
-            .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
-        Log.w(TAG, "flash unit available: $hasFlash")
+        val chars = manager.getCameraCharacteristics(cameraId)
+        hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        // Both characteristics are int[] in the Java API (dumpsys shows the HAL's byte[]).
+        hasOIS = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?.any { it == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON } == true
+        hasEIS = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            ?.any { it == CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON } == true
+        Log.w(TAG, "flash=$hasFlash OIS=$hasOIS EIS=$hasEIS")
 
         val allCodecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
         allCodecs.filter { it.isEncoder && it.supportedTypes.any { t -> t == "video/avc" } }
@@ -227,7 +241,14 @@ class CameraEncoder(
         set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
         set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
         set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_OFF)
-        set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+        // OIS on whenever the hardware has it: optical, so no crop and no added latency.
+        if (hasOIS) {
+            set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        }
+        set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+            if (eisOn && hasEIS) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+            else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
         set(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_OFF)
         set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_OFF)
         set(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_FAST)
@@ -289,6 +310,23 @@ class CameraEncoder(
             )
             Log.w(TAG, "torch ${if (on) "ON" else "OFF"}")
         } catch (e: Exception) { Log.e(TAG, "setTorch failed: $e") }
+    }
+
+    // Electronic stabilization on/off. Re-issues the repeating request so it takes effect
+    // immediately, the same way the torch does.
+    fun setEIS(on: Boolean) {
+        if (!hasEIS) { Log.w(TAG, "setEIS: camera has no video stabilization, ignored"); return }
+        val cam = cameraDevice ?: run { Log.w(TAG, "setEIS: no cameraDevice, ignored"); return }
+        val session = captureSession ?: run { Log.w(TAG, "setEIS: no captureSession, ignored"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "setEIS: no captureSurface, ignored"); return }
+        eisOn = on
+        val preview = previewHolder?.surface
+        try {
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, currentAfApiMode), captureCallback, cameraHandler
+            )
+            Log.w(TAG, "EIS ${if (on) "ON" else "OFF"}")
+        } catch (e: Exception) { Log.e(TAG, "setEIS failed: $e") }
     }
 
     fun setContinuousAf() {

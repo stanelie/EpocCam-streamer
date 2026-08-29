@@ -276,6 +276,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         server?.enqueue(Protocol.buildFocusStatePacket(focusState))
     }
 
+    // Capability + state, so the viewer can render the control correctly instead of guessing
+    // what this phone can do. OIS has no toggle: it is enabled whenever present.
+    private fun sendStabilizationState() {
+        val e = encoder ?: return
+        server?.enqueue(Protocol.buildStabilizationPacket(
+            eisSupported = e.hasEIS, eisOn = e.eisEnabled,
+            oisSupported = e.hasOIS, oisOn = e.hasOIS))
+    }
+
     // Focus commands from the viewer. Touches the UI and the encoder, so it runs on the
     // main thread rather than the socket's receive thread.
     private fun onFocusCommandFromViewer(cmd: Int) = runOnUiThread {
@@ -598,12 +607,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     if (connected) {
                         sendBatteryReport()   // don't leave the viewer blank for up to a minute
                         sendFocusState()      // so the viewer's focus button starts in sync
+                        sendStabilizationState()
                     }
                 }
             },
             onFormatSelect     = { idx -> onFormatSelected(idx) },
             onTorch            = { on -> encoder?.setTorch(on) },
             onFocusCommand     = { cmd -> onFocusCommandFromViewer(cmd) },
+            onStabilization    = { on -> runOnUiThread { encoder?.setEIS(on); sendStabilizationState() } },
             onViewerDisconnect = { onViewerDisconnected() },
             capabilityPacket   = capPkt
         ).also { it.start() }

@@ -124,6 +124,27 @@ object Protocol {
         return buf
     }
 
+    // Stabilization state (type 0x0002000B, phone -> viewer). Carries capability as well as
+    // state so the viewer can hide the control on a camera that can't do it, rather than
+    // offering a button that silently does nothing.
+    // Payload: [0]=eisSupported [1]=eisOn [2]=oisSupported [3]=oisOn
+    fun buildStabilizationPacket(eisSupported: Boolean, eisOn: Boolean,
+                                 oisSupported: Boolean, oisOn: Boolean): ByteArray {
+        val payload = byteArrayOf(
+            if (eisSupported) 1 else 0, if (eisOn) 1 else 0,
+            if (oisSupported) 1 else 0, if (oisOn) 1 else 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x0002000B)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
     private fun putLE32(buf: ByteArray, offset: Int, value: Int) {
         buf[offset]     = (value and 0xFF).toByte()
         buf[offset + 1] = ((value shr 8) and 0xFF).toByte()
