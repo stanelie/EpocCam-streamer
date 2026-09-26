@@ -164,6 +164,27 @@ object Protocol {
         return buf
     }
 
+    // Camera-facing state (type 0x0002000F, phone -> viewer). Capability travels with state,
+    // as with stabilization and frame rate: a phone with no front camera gets the control
+    // disabled rather than a button that silently does nothing.
+    // Payload: [0]=facingFront [1]=frontAvailable [2]=backAvailable [3]=pad
+    fun buildCameraStatePacket(facingFront: Boolean, frontAvailable: Boolean,
+                               backAvailable: Boolean): ByteArray {
+        val payload = byteArrayOf(
+            if (facingFront) 1 else 0, if (frontAvailable) 1 else 0,
+            if (backAvailable) 1 else 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x0002000F)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
     private fun putLE32(buf: ByteArray, offset: Int, value: Int) {
         buf[offset]     = (value and 0xFF).toByte()
         buf[offset + 1] = ((value shr 8) and 0xFF).toByte()

@@ -42,6 +42,9 @@ class CameraEncoder(
     // Carried across encoder rebuilds (a resolution change constructs a new CameraEncoder),
     // so stabilization isn't silently lost whenever the format changes.
     initialEIS: Boolean = false,
+    // Which physical camera to open. Switching is a full rebuild: the camera device itself
+    // changes, so there is nothing to reconfigure on the running session.
+    private val useFrontCamera: Boolean = false,
     private val onNalUnit: (data: ByteArray, offset: Int, size: Int, isSps: Boolean) -> Unit
 ) {
     private val running = AtomicBoolean(false)
@@ -78,6 +81,11 @@ class CameraEncoder(
     // configuration outright (a black preview, the failure mode we already fight on the
     // older Exynos phones). So the request is clamped to what this device really offers and
     // the viewer is told the rate it actually got, rather than the one it asked for.
+    // What this device actually offers, and which way we ended up facing — a phone with no
+    // front camera, or one that fails to open it, still has to stream rather than die.
+    @Volatile var hasFrontCamera = false; private set
+    @Volatile var hasBackCamera = false; private set
+    @Volatile var facingFront = useFrontCamera; private set
     @Volatile var supportsHighFps = false; private set
     @Volatile var activeFps = fps; private set
     private var fpsRange: android.util.Range<Int> = android.util.Range(fps, fps)
@@ -122,11 +130,21 @@ class CameraEncoder(
         Log.w(TAG, "start() w=$width h=$height bitrate=$bitrate")
 
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = manager.cameraIdList.firstOrNull { id ->
-            manager.getCameraCharacteristics(id)
-                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
-        } ?: manager.cameraIdList[0]
-        Log.w(TAG, "camera=$cameraId")
+        fun facing(id: String) = manager.getCameraCharacteristics(id)
+            .get(CameraCharacteristics.LENS_FACING)
+        val frontId = manager.cameraIdList.firstOrNull {
+            facing(it) == CameraCharacteristics.LENS_FACING_FRONT }
+        val backId  = manager.cameraIdList.firstOrNull {
+            facing(it) == CameraCharacteristics.LENS_FACING_BACK }
+        hasFrontCamera = frontId != null
+        hasBackCamera  = backId != null
+        // Fall back to whatever exists rather than failing: report back what was actually
+        // opened so the viewer's button reflects the real camera, not the requested one.
+        val cameraId = (if (useFrontCamera) frontId ?: backId else backId ?: frontId)
+            ?: manager.cameraIdList[0]
+        facingFront = facing(cameraId) == CameraCharacteristics.LENS_FACING_FRONT
+        Log.w(TAG, "camera=$cameraId facingFront=$facingFront " +
+                   "(front=$frontId back=$backId requested=${if (useFrontCamera) "front" else "back"})")
         val chars = manager.getCameraCharacteristics(cameraId)
         hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
         // Both characteristics are int[] in the Java API (dumpsys shows the HAL's byte[]).

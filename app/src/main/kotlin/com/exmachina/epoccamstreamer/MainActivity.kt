@@ -66,6 +66,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var previewView: AspectRatioSurfaceView
     private lateinit var focusModeButton: Button
     private lateinit var lockButton: Button
+    private lateinit var cameraButton: Button
     private lateinit var lockedBadge: TextView
     private lateinit var batteryText: TextView
 
@@ -149,6 +150,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // survives encoder rebuilds so a resolution change doesn't silently drop back to 30.
     @Volatile private var desiredFps = DEFAULT_FPS
 
+    // Which camera to open. Persisted on the phone itself (not just in the viewer) so the
+    // operator can preset a phone and have it come up facing the right way at launch, before
+    // any viewer is connected. The viewer's own per-slot setting is re-applied on connect,
+    // like resolution and frame rate, so a connected viewer has the final say.
+    @Volatile private var desiredFront = false
+    private fun loadCameraPref() {
+        desiredFront = getSharedPreferences("epoccam", MODE_PRIVATE)
+            .getBoolean("useFrontCamera", false)
+    }
+    private fun saveCameraPref() {
+        getSharedPreferences("epoccam", MODE_PRIVATE).edit()
+            .putBoolean("useFrontCamera", desiredFront).apply()
+    }
+
     // Default to SD (format index 1 = 640×480); switched to HD on viewer request.
     @Volatile private var currentFmt = 1
 
@@ -222,6 +237,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Before anything builds an encoder: this decides which camera gets opened.
+        loadCameraPref()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
         statusText = findViewById(R.id.statusText)
@@ -242,6 +259,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 triggerFocus()
             }
         }
+
+        cameraButton = findViewById(R.id.cameraButton)
+        cameraButton.setOnClickListener {
+            // Off the main thread: the rebuild blocks on the camera close.
+            val want = !desiredFront
+            cameraButton.isEnabled = false
+            Thread({
+                onCameraSelected(want)
+                runOnUiThread { cameraButton.isEnabled = true }
+            }, "epoc-camswitch").start()
+        }
+        updateCameraButton()
 
         lockButton = findViewById(R.id.lockButton)
         lockedBadge = findViewById(R.id.lockedBadge)
@@ -296,6 +325,47 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun sendFpsState() {
         val e = encoder ?: return
         server?.enqueue(Protocol.buildFpsStatePacket(e.activeFps, e.supportsHighFps))
+    }
+
+    private fun updateCameraButton() {
+        if (!::cameraButton.isInitialized) return
+        cameraButton.text = if (desiredFront) "front\ncamera" else "back\ncamera"
+    }
+
+    // Which camera is actually open, plus what this device has. Sent after every rebuild,
+    // so a phone that fell back (no front camera, or it failed to open) reports the camera it
+    // really got rather than the one that was asked for.
+    private fun sendCameraState() {
+        val e = encoder ?: return
+        server?.enqueue(Protocol.buildCameraStatePacket(
+            facingFront = e.facingFront,
+            frontAvailable = e.hasFrontCamera, backAvailable = e.hasBackCamera))
+    }
+
+    // Front/back switch. The camera device itself changes, so there is nothing to
+    // reconfigure on the running session — it is a full rebuild, same as a frame-rate change,
+    // and must not run on the main thread for the same reason (stop() blocks on the close).
+    fun onCameraSelected(front: Boolean) {
+        if (front == desiredFront && encoder != null) {
+            Log.w(TAG, "onCameraSelected: already ${if (front) "front" else "back"} — reporting state only")
+            sendCameraState()
+            return
+        }
+        Log.w(TAG, "camera change: ${if (desiredFront) "front" else "back"} → ${if (front) "front" else "back"}")
+        desiredFront = front
+        saveCameraPref()
+        rebuildEncoderForFormat(currentFmt, geometryChanged = false)
+        // Settle on the camera actually opened, so a phone with no front camera doesn't sit
+        // with desiredFront=true and rebuild on every later request for the camera it is
+        // already using.
+        encoder?.let {
+            if (it.facingFront != desiredFront) {
+                Log.w(TAG, "camera fell back to ${if (it.facingFront) "front" else "back"}")
+                desiredFront = it.facingFront
+                saveCameraPref()
+            }
+        }
+        runOnUiThread { updateCameraButton() }
     }
 
     // Frame-rate change from the viewer. MediaCodec's frame rate and the camera's AE target
@@ -448,6 +518,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             fps           = desiredFps,
             bitrate       = BITRATES[fmt],
             initialEIS    = desiredEIS,
+            useFrontCamera = desiredFront,
             onNalUnit     = ::onNalUnit
         ).also { it.start() }
         // A rebuild resets what the viewer knows: report the new encoder's capability and
@@ -455,6 +526,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // read off an encoder that was being torn down).
         sendStabilizationState()
         sendFpsState()
+        sendCameraState()
         formatSelected.set(true)
         if (!geometryChanged) {
             Log.w(TAG, "new encoder started (same geometry — no relayout needed)")
@@ -497,6 +569,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     fps           = desiredFps,
                     bitrate       = BITRATES[fmt],
                     initialEIS    = desiredEIS,
+                    useFrontCamera = desiredFront,
                     onNalUnit     = ::onNalUnit
                 ).also { it.start() }
                 // A rebuild resets what the viewer knows: report the new encoder's capability
@@ -504,6 +577,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 // "unsupported", read off an encoder that was being torn down).
                 sendStabilizationState()
                 sendFpsState()
+                sendCameraState()
                 lastKeyframeMs = android.os.SystemClock.elapsedRealtime()
                 formatSelected.set(true)
                 Log.w(TAG, "SELF-HEAL: encoder recreated")
@@ -680,6 +754,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         sendFocusState()      // so the viewer's focus button starts in sync
                         sendStabilizationState()
                         sendFpsState()        // so the viewer's frame-rate menu starts in sync
+                        sendCameraState()
                     }
                 }
             },
@@ -689,6 +764,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // frame and stalls reconnect handling until the close finally returns. Runs on
             // the socket's receive thread, exactly like the resolution change it mirrors.
             onFpsSelect        = { f -> onFpsSelected(f) },
+            // Same as onFpsSelect: rebuilds the encoder, so it stays off the main thread.
+            onCameraSelect     = { front -> onCameraSelected(front) },
             onTorch            = { on -> encoder?.setTorch(on) },
             onFocusCommand     = { cmd -> onFocusCommandFromViewer(cmd) },
             onStabilization    = { on -> runOnUiThread {
@@ -704,6 +781,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             fps           = desiredFps,
             bitrate       = BITRATES[currentFmt],
             initialEIS    = desiredEIS,
+            useFrontCamera = desiredFront,
             onNalUnit     = ::onNalUnit
         ).also { it.start() }
         registerMdns()
@@ -781,7 +859,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             data[offset] == 0.toByte() && data[offset+1] == 0.toByte() &&
             data[offset+2] == 0.toByte() && data[offset+3] == 1.toByte()) 1 else 0
         val nalData = data.copyOfRange(offset + skip, offset + size)
-        val hdr = Protocol.buildHeader(nalData.size, 0xFFFFFFFFL)
+        val hdr = Protocol.buildHeader(nalData.size, 0xFFFFFFFFL,
+            cameraFlags = if (encoder?.facingFront == true) 0x10 else 0)
         val packet = ByteArray(28 + nalData.size)
         System.arraycopy(hdr, 0, packet, 0, 28)
         System.arraycopy(nalData, 0, packet, 28, nalData.size)

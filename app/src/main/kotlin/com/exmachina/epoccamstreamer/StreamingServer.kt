@@ -19,6 +19,7 @@ class StreamingServer(
     private val onFocusCommand: (Int) -> Unit = {},
     private val onStabilization: (Boolean) -> Unit = {},
     private val onFpsSelect: (Int) -> Unit = {},
+    private val onCameraSelect: (Boolean) -> Unit = {},
     private val onViewerDisconnect: () -> Unit = {},
     var capabilityPacket: ByteArray? = null
 ) {
@@ -147,6 +148,10 @@ class StreamingServer(
                                 val on = rxBuf[16].toInt() != 0
                                 Log.w(TAG, "stabilization request: ${if (on) "ON" else "OFF"}")
                                 onStabilization(on)
+                            } else if (type == 0x0002000E) {
+                                val front = rxBuf[16].toInt() != 0
+                                Log.w(TAG, "camera request: ${if (front) "FRONT" else "BACK"}")
+                                onCameraSelect(front)
                             } else if (type == 0x0002000C) {
                                 val f = rxBuf[16].toInt() and 0xFF
                                 Log.w(TAG, "frame-rate request: ${f}fps")

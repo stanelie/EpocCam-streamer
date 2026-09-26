@@ -71,6 +71,21 @@
             android:gravity="center"
             android:padding="0dp" />
 
+        <!-- Front/back camera. Sits under the focus toggle, same size, so the two
+             upper-right controls read as a pair. -->
+        <Button
+            android:id="@+id/cameraButton"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
+            android:layout_marginTop="6dp"
+            android:text="back\ncamera"
+            android:textSize="18sp"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#80000000"
+            android:maxLines="2"
+            android:gravity="center"
+            android:padding="0dp" />
+
     </LinearLayout>
 
     <!-- Lock: lower-right, away from the top of frame where tap-to-focus is most likely
