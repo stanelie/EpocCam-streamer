@@ -74,6 +74,12 @@ class CameraEncoder(
     // motion — so it can cost real latency. Off by default and driven from the viewer so the
     // penalty can be measured rather than assumed.
     @Volatile var hasEIS = false; private set
+    // Not every camera can focus. A fixed-focus front camera (the S7-class ones) accepts only
+    // CONTROL_AF_MODE_OFF and reports CONTROL_AF_STATE as null, so a focus request never
+    // reports a lock: the operator gets "focusing…" timing out into "manual focus?" rather
+    // than being told the camera simply cannot do it. Read from the HAL and reported to the
+    // viewer, exactly as flash, EIS and 60fps already are.
+    @Volatile var hasAutoFocus = false; private set
     @Volatile private var eisOn = initialEIS
     val eisEnabled: Boolean get() = eisOn
     // Not every camera can sustain 60fps, and CONTROL_AE_TARGET_FPS_RANGE only accepts a
@@ -96,8 +102,16 @@ class CameraEncoder(
     // rather than CameraManager.setTorchMode(), which is not usable while we own the camera.
     @Volatile private var torchOn = false
 
-    // AF state
-    @Volatile private var currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+    // AF state. Both modes are resolved from CONTROL_AF_AVAILABLE_MODES once the camera is
+    // open, rather than assumed: asking for a mode the HAL does not advertise is silently
+    // ignored, the lens never moves, and the result is indistinguishable from a broken
+    // feature. CONTINUOUS_VIDEO in particular is not universal — some front cameras list
+    // only CONTINUOUS_PICTURE, or only AUTO.
+    @Volatile private var continuousAfMode = CaptureRequest.CONTROL_AF_MODE_OFF
+    // The one-shot lock behind manual focus. Needs AF_MODE_AUTO; without it there is no lock
+    // to take, which is what hasAutoFocus reports.
+    @Volatile private var oneShotAfMode = CaptureRequest.CONTROL_AF_MODE_OFF
+    @Volatile private var currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_OFF
     private val afStateListener = AtomicReference<((Int) -> Unit)?>(null)
 
     // Rate-limited: what the HAL *actually applied*, which is not necessarily what we asked
@@ -152,6 +166,29 @@ class CameraEncoder(
             ?.any { it == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON } == true
         hasEIS = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
             ?.any { it == CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON } == true
+        // Which AF modes this camera really has, and hence whether manual focus is offerable
+        // at all. CONTROL_AF_AVAILABLE_MODES is the authority: it is mandatory metadata at
+        // every hardware level, and is documented to contain AF_MODE_AUTO whenever the device
+        // can autofocus and nothing but OFF on a fixed-focus lens.
+        //
+        // LENS_INFO_MINIMUM_FOCUS_DISTANCE is logged but deliberately *not* part of the
+        // decision. A value of 0 also means "fixed focus", but it is optional metadata below
+        // hardware level FULL and so may be absent or simply wrong — and getting it wrong
+        // here disables a focus control that works, which is worse than the bug being fixed.
+        // If a phone turns out to lie in its mode list, the log line below will show it.
+        val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
+        val minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+        fun firstAfMode(vararg wanted: Int) = wanted.firstOrNull { afModes.contains(it) }
+        continuousAfMode = firstAfMode(
+            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+            CaptureRequest.CONTROL_AF_MODE_AUTO) ?: CaptureRequest.CONTROL_AF_MODE_OFF
+        // Manual focus is a one-shot lock, which needs AF_MODE_AUTO: a camera offering only
+        // a continuous mode can focus but cannot hold it, so there is no lock to offer.
+        oneShotAfMode = firstAfMode(CaptureRequest.CONTROL_AF_MODE_AUTO)
+            ?: CaptureRequest.CONTROL_AF_MODE_OFF
+        hasAutoFocus = oneShotAfMode != CaptureRequest.CONTROL_AF_MODE_OFF
+        currentAfApiMode = continuousAfMode
         val aeRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         supportsHighFps = pickFpsRange(aeRanges, HIGH_FPS) != null
         // Fall back rather than fail: a phone that can't do the requested rate still streams.
@@ -161,6 +198,9 @@ class CameraEncoder(
         Log.w(TAG, "flash=$hasFlash OIS=$hasOIS EIS=$hasEIS " +
                    "fps=$activeFps range=$fpsRange high60=$supportsHighFps " +
                    "advertised=${aeRanges?.joinToString()}")
+        Log.w(TAG, "AF: hasAutoFocus=$hasAutoFocus continuous=$continuousAfMode " +
+                   "oneShot=$oneShotAfMode minFocusDist=$minFocusDist " +
+                   "availableModes=${afModes.joinToString()}")
 
         val allCodecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
         allCodecs.filter { it.isEncoder && it.supportedTypes.any { t -> t == "video/avc" } }
@@ -420,7 +460,10 @@ class CameraEncoder(
     }
 
     fun setContinuousAf() {
-        currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+        if (continuousAfMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
+            Log.w(TAG, "setContinuousAf: this camera is fixed-focus, ignored"); return
+        }
+        currentAfApiMode = continuousAfMode
         afStateListener.set(null)
         val cam = cameraDevice ?: run { Log.w(TAG, "setContinuousAf: no cameraDevice, ignored"); return }
         val session = captureSession ?: run { Log.w(TAG, "setContinuousAf: no captureSession, ignored"); return }
@@ -433,33 +476,49 @@ class CameraEncoder(
             // repeating request below was already being sent successfully, but focus never
             // actually resumed moving until this cancel was added).
             session.capture(
-                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+                buildRequest(cam, preview, enc, continuousAfMode,
                     CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
                 null, cameraHandler
             )
             session.setRepeatingRequest(
-                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO),
+                buildRequest(cam, preview, enc, continuousAfMode),
                 captureCallback, cameraHandler
             )
         } catch (e: Exception) { Log.e(TAG, "setContinuousAf failed: $e") }
     }
 
-    fun triggerAfAndLock(onDone: (focused: Boolean) -> Unit) {
-        val cam = cameraDevice ?: run { Log.w(TAG, "triggerAfAndLock: no cameraDevice, ignored"); return }
-        val session = captureSession ?: run { Log.w(TAG, "triggerAfAndLock: no captureSession, ignored"); return }
-        val enc = captureSurface ?: run { Log.w(TAG, "triggerAfAndLock: no captureSurface, ignored"); return }
+    // Returns false when the lock was never started, so the caller can leave its UI alone
+    // instead of showing "focusing…" for a convergence that will never be reported. A
+    // fixed-focus camera is the main case: CONTROL_AF_STATE comes back null there, so the
+    // listener below would never fire and the operator would wait out the caller's timeout.
+    fun triggerAfAndLock(onDone: (focused: Boolean) -> Unit): Boolean {
+        if (!hasAutoFocus) {
+            Log.w(TAG, "triggerAfAndLock: this camera is fixed-focus, ignored"); return false
+        }
+        val cam = cameraDevice ?: run { Log.w(TAG, "triggerAfAndLock: no cameraDevice, ignored"); return false }
+        val session = captureSession ?: run { Log.w(TAG, "triggerAfAndLock: no captureSession, ignored"); return false }
+        val enc = captureSurface ?: run { Log.w(TAG, "triggerAfAndLock: no captureSurface, ignored"); return false }
         val preview = previewHolder?.surface
-        currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_AUTO
+        currentAfApiMode = oneShotAfMode
         try {
             // Cancel any prior lock so AF state machine resets
             session.capture(
-                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_AUTO,
+                buildRequest(cam, preview, enc, oneShotAfMode,
                     CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
                 null, cameraHandler
             )
             // Arm listener before triggering
             var reported = false
+            var lastState = -1
             afStateListener.set { state ->
+                // Every transition while a lock is converging, logged once per distinct value.
+                // A camera that accepts the trigger but never reaches a *_LOCKED state — so
+                // the caller falls back to its timeout — is otherwise indistinguishable from
+                // one that ignored the request outright, and the two need different fixes.
+                if (state != lastState) {
+                    lastState = state
+                    Log.w(TAG, "AF state -> $state (mode=$oneShotAfMode)")
+                }
                 if (!reported && (state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
                                   state == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)) {
                     reported = true
@@ -469,16 +528,17 @@ class CameraEncoder(
             }
             // One-shot trigger
             session.capture(
-                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_AUTO,
+                buildRequest(cam, preview, enc, oneShotAfMode,
                     CaptureRequest.CONTROL_AF_TRIGGER_START),
                 captureCallback, cameraHandler
             )
             // Repeating with AF_MODE_AUTO keeps AF locked and feeds state to the listener
             session.setRepeatingRequest(
-                buildRequest(cam, preview, enc, CaptureRequest.CONTROL_AF_MODE_AUTO),
+                buildRequest(cam, preview, enc, oneShotAfMode),
                 captureCallback, cameraHandler
             )
-        } catch (e: Exception) { Log.e(TAG, "triggerAfAndLock failed: $e") }
+        } catch (e: Exception) { Log.e(TAG, "triggerAfAndLock failed: $e"); return false }
+        return true
     }
 
     private fun drainLoop() {

@@ -108,10 +108,18 @@ object Protocol {
     }
 
     // Build a focus-state packet (type 0x00020009, phone -> viewer) so the viewer's focus
-    // button can mirror this phone rather than guess. Payload: [0]=state, [1-3]=pad.
-    // States match FOCUS_STATE_* in MainActivity: 0=auto 1=manual 2=focusing 3=manual-unsure.
-    fun buildFocusStatePacket(state: Int): ByteArray {
-        val payload = byteArrayOf(state.toByte(), 0, 0, 0)
+    // button can mirror this phone rather than guess. Payload: [0]=state [1]=afSupported
+    // [2-3]=pad. States match FOCUS_STATE_* in MainActivity: 0=auto 1=manual 2=focusing
+    // 3=manual-unsure.
+    //
+    // afSupported was added in the previously-padding byte [1], so an older viewer reads it
+    // as before and a newer viewer talking to an older phone sees 0 — which greys the
+    // control out rather than offering a dead one, the safe way round. It carries capability
+    // alongside state for the same reason the stabilization, frame-rate and camera-facing
+    // packets do: a fixed-focus camera has no lock to take, and a button that silently does
+    // nothing is worse than one that is visibly unavailable.
+    fun buildFocusStatePacket(state: Int, afSupported: Boolean): ByteArray {
+        val payload = byteArrayOf(state.toByte(), if (afSupported) 1 else 0, 0, 0)
         val buf = ByteArray(28 + payload.size)
         putLE32(buf, 0,  0xDEADC0DE.toInt())
         putLE32(buf, 4,  0x00000000)

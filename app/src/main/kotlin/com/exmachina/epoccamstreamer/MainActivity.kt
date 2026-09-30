@@ -40,6 +40,7 @@ private const val FOCUS_AUTO    = "auto\nfocus"
 private const val FOCUS_MANUAL  = "manual\nfocus"
 private const val FOCUS_BUSY    = "focusing\n…"
 private const val FOCUS_UNSURE  = "manual\nfocus?"   // AF never reported a lock
+private const val FOCUS_NONE    = "fixed\nfocus"    // this camera cannot focus at all
 
 // Focus state, mirrored to the viewer so its button shows what this phone is actually
 // doing rather than what it last asked for. Must stay in sync with the viewer's FocusState.
@@ -250,6 +251,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         focusModeButton = findViewById(R.id.focusModeButton)
         focusModeButton.setOnClickListener {
+            if (!afSupported()) return@setOnClickListener
             if (tapFocusMode) {
                 applyAutoFocus()
             } else {
@@ -297,7 +299,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // viewer, so the two can't drift apart.
     private fun setFocusState(state: Int) {
         focusState = state
-        focusModeButton.text = when (state) {
+        // A fixed-focus camera gets a visibly dead button rather than a live one that does
+        // nothing: the S7-class front cameras cannot focus at all, and the old behaviour was
+        // to accept the press, show "focusing…" and time out into "manual focus?" — which
+        // reads as a bug in the app rather than a limit of the hardware.
+        val supported = afSupported()
+        focusModeButton.isEnabled = supported
+        focusModeButton.alpha = if (supported) 1f else 0.4f
+        focusModeButton.text = if (!supported) FOCUS_NONE else when (state) {
             FOCUS_STATE_AUTO   -> FOCUS_AUTO
             FOCUS_STATE_MANUAL -> FOCUS_MANUAL
             FOCUS_STATE_BUSY   -> FOCUS_BUSY
@@ -306,8 +315,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         sendFocusState()
     }
 
+    // Whether the camera currently open can focus. Read off the live encoder rather than
+    // remembered, because it changes with the camera: the back camera focuses and the front
+    // one may not.
+    private fun afSupported(): Boolean = encoder?.hasAutoFocus ?: false
+
     private fun sendFocusState() {
-        server?.enqueue(Protocol.buildFocusStatePacket(focusState))
+        server?.enqueue(Protocol.buildFocusStatePacket(focusState, afSupported()))
+    }
+
+    // A new CameraEncoder always comes up in continuous AF, so any lock taken before a
+    // rebuild (camera switch, resolution or frame-rate change, self-heal) no longer exists —
+    // and the newly opened camera may not focus at all. Without this reset tapFocusMode stayed
+    // true across a camera switch: phone and viewer both still read "manual focus" while the
+    // lens was in fact hunting, and the next press of the focus button took the *auto* branch,
+    // so engaging manual focus on the newly selected camera did nothing until pressed twice.
+    private fun resetFocusAfterRebuild() = runOnUiThread {
+        tapFocusMode = false
+        focusInProgress = false
+        focusTimeoutHandler.removeCallbacksAndMessages(null)
+        setFocusState(FOCUS_STATE_AUTO)
     }
 
     // Capability + state, so the viewer can render the control correctly instead of guessing
@@ -397,6 +424,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     // Focus commands from the viewer. Touches the UI and the encoder, so it runs on the
     // main thread rather than the socket's receive thread.
     private fun onFocusCommandFromViewer(cmd: Int) = runOnUiThread {
+        // A viewer that predates the capability byte, or one whose operator got the command in
+        // before the state packet landed, can still ask a fixed-focus camera to focus. Answer
+        // with the real state rather than starting a lock that cannot complete.
+        if (cmd != FOCUS_CMD_AUTO && !afSupported()) {
+            Log.w(TAG, "focus command $cmd: this camera is fixed-focus, reporting state only")
+            setFocusState(FOCUS_STATE_AUTO)
+            return@runOnUiThread
+        }
         when (cmd) {
             FOCUS_CMD_AUTO    -> if (tapFocusMode) applyAutoFocus()
             FOCUS_CMD_MANUAL  -> if (!tapFocusMode) { tapFocusMode = true; triggerFocus() }
@@ -420,12 +455,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun triggerFocus() {
         if (focusInProgress) return  // ignore a retap while the previous attempt is still converging
         val enc = encoder ?: return
+        if (!enc.hasAutoFocus) {
+            // Nothing to focus. Report state so the viewer's button settles instead of
+            // waiting on a convergence that is never coming.
+            Log.w(TAG, "triggerFocus: ${if (enc.facingFront) "front" else "back"} camera is fixed-focus, ignored")
+            tapFocusMode = false
+            setFocusState(FOCUS_STATE_AUTO)
+            return
+        }
         focusInProgress = true
         setFocusState(FOCUS_STATE_BUSY)
         // Safety net: if the camera never reports a final AF state (edge case — see
         // CameraEncoder.triggerAfAndLock), don't leave focus permanently stuck ignoring taps.
         focusTimeoutHandler.postDelayed({ finishFocus(focused = false) }, 4_000L)
-        enc.triggerAfAndLock { focused -> runOnUiThread { finishFocus(focused) } }
+        // A lock that never started must not leave the button reading "focusing…" for the
+        // full timeout: undo the optimistic state immediately instead.
+        if (!enc.triggerAfAndLock { focused -> runOnUiThread { finishFocus(focused) } }) {
+            Log.w(TAG, "triggerFocus: the camera would not start a lock")
+            tapFocusMode = false
+            focusInProgress = false
+            focusTimeoutHandler.removeCallbacksAndMessages(null)
+            setFocusState(FOCUS_STATE_AUTO)
+        }
     }
 
     private fun finishFocus(focused: Boolean) {
@@ -527,6 +578,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         sendStabilizationState()
         sendFpsState()
         sendCameraState()
+        resetFocusAfterRebuild()
         formatSelected.set(true)
         if (!geometryChanged) {
             Log.w(TAG, "new encoder started (same geometry — no relayout needed)")
@@ -578,6 +630,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 sendStabilizationState()
                 sendFpsState()
                 sendCameraState()
+                resetFocusAfterRebuild()
                 lastKeyframeMs = android.os.SystemClock.elapsedRealtime()
                 formatSelected.set(true)
                 Log.w(TAG, "SELF-HEAL: encoder recreated")
@@ -784,6 +837,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             useFrontCamera = desiredFront,
             onNalUnit     = ::onNalUnit
         ).also { it.start() }
+        // The first encoder, so the phone's own focus button reflects the camera that just
+        // opened instead of the layout's optimistic "auto focus" label.
+        resetFocusAfterRebuild()
         registerMdns()
         watchdogHandler.postDelayed(watchdogRunnable, 3_000L)
         watchdogHandler.postDelayed(batteryReportRunnable, 60_000L)
