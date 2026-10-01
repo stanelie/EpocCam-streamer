@@ -29,6 +29,9 @@ private const val TAG = "CameraEncoder"
 // interval) off end-to-end latency on a Pixel 5 at 720p, at the cost of halving per-frame
 // quality for the same CBR bitrate — worth it for some material and not others, hence a
 // per-camera setting rather than a hardcoded rate.
+// How long to wait for a real *_LOCKED state before accepting a passive AF verdict instead.
+private const val PASSIVE_AF_GRACE_MS = 1_500L
+
 const val DEFAULT_FPS = 30
 const val HIGH_FPS = 60
 
@@ -510,6 +513,53 @@ class CameraEncoder(
             // Arm listener before triggering
             var reported = false
             var lastState = -1
+            // Some HALs accept the one-shot mode and then never deliver a *_LOCKED state: the
+            // Galaxy S8's front camera runs its continuous AF instead and settles into
+            // PASSIVE_FOCUSED/PASSIVE_UNFOCUSED. The lens really does focus, so timing out and
+            // reporting "couldn't confirm" is wrong — but a passive state cannot simply be
+            // accepted, because a camera that *does* lock passes through PASSIVE_FOCUSED on
+            // the way (the S8's rear camera goes 2 -> 0 -> 3 -> 4). Taking it immediately
+            // would call the lock done before the lens had settled.
+            //
+            // So: always prefer a real lock, and only fall back to the last passive verdict if
+            // none has arrived by the time this grace window expires — comfortably inside the
+            // caller's 4s timeout, so a HAL like this resolves in about a second instead of
+            // timing out.
+            // "Did the lens ever reach focus during this attempt", not "what was it doing at
+            // the deadline". These HALs keep their continuous AF running after converging, so
+            // a successful PASSIVE_FOCUSED is routinely followed by PASSIVE_UNFOCUSED as the
+            // camera re-evaluates the scene — taking the latest value turned a focus that
+            // worked into "manual focus?".
+            var sawPassiveFocused = false
+            var anyPassive = false
+            var graceExpired = false
+            // Third HAL behaviour, the S8's front camera: it runs the scan and then returns
+            // to INACTIVE without ever reporting a verdict — no *_LOCKED, not even a passive
+            // one. There is nothing to wait for, so the old code sat on "focusing…" for the
+            // caller's full 4s timeout and then said "manual focus?" about a focus that had
+            // visibly succeeded. ACTIVE_SCAN followed by INACTIVE means the scan ran to
+            // completion, so treat that as the verdict. Cameras that do report a lock never
+            // take this path: they go scan -> *_LOCKED and finish above.
+            var sawActiveScan = false
+            fun finish(focused: Boolean) {
+                if (reported) return
+                reported = true
+                afStateListener.set(null)
+                onDone(focused)
+            }
+            // Runs on cameraHandler, the same thread as the listener below, so these flags
+            // need no synchronisation.
+            cameraHandler.postDelayed({
+                graceExpired = true
+                if (!reported && anyPassive) {
+                    Log.w(TAG, "AF: no locked state after ${PASSIVE_AF_GRACE_MS}ms, " +
+                               "passive verdict focused=$sawPassiveFocused")
+                    finish(sawPassiveFocused)
+                }
+                // Nothing passive yet (the camera is still scanning): don't force a verdict
+                // out of thin air — the listener below resolves on the next passive state
+                // instead of leaving the operator on "focusing…" until the caller's timeout.
+            }, PASSIVE_AF_GRACE_MS)
             afStateListener.set { state ->
                 // Every transition while a lock is converging, logged once per distinct value.
                 // A camera that accepts the trigger but never reaches a *_LOCKED state — so
@@ -519,11 +569,26 @@ class CameraEncoder(
                     lastState = state
                     Log.w(TAG, "AF state -> $state (mode=$oneShotAfMode)")
                 }
-                if (!reported && (state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
-                                  state == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)) {
-                    reported = true
-                    afStateListener.set(null)
-                    onDone(state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
+                if (state == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                    state == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED) {
+                    anyPassive = true
+                    if (state == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED) {
+                        sawPassiveFocused = true
+                    }
+                    if (graceExpired) {
+                        Log.w(TAG, "AF: first passive state after grace, " +
+                                   "focused=$sawPassiveFocused")
+                        finish(sawPassiveFocused)
+                    }
+                }
+                if (state == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN) sawActiveScan = true
+                if (sawActiveScan && state == CaptureResult.CONTROL_AF_STATE_INACTIVE) {
+                    Log.w(TAG, "AF: scan completed with no verdict reported, treating as focused")
+                    finish(true)
+                }
+                if (state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                    state == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED) {
+                    finish(state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
                 }
             }
             // One-shot trigger
