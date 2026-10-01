@@ -10,7 +10,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "StreamingServer"
 private const val PORT_LISTEN = 5054
-private const val MAX_QUEUE = 60
+// Frames the send queue may hold. This is a latency budget, not a safety margin: every
+// frame waiting here is a frame the viewer will display late. At 60 (two seconds at 30fps) a
+// link that cannot carry the bitrate fills the queue and *keeps* it full under drop-oldest,
+// so the feed settles two seconds behind and every drain is seen as a fast-forward burst —
+// far worse for a live operator than simply missing frames. 15 caps the damage at ~0.5s at
+// 30fps (~0.25s at 60), and the encoder's 1s IDR cadence resyncs the decoder after a drop
+// without anyone having to ask for a keyframe.
+private const val MAX_QUEUE = 15
 
 class StreamingServer(
     private val onStatus: (String) -> Unit,
@@ -30,6 +37,12 @@ class StreamingServer(
     @Volatile private var currentSocket: Socket? = null
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var lastSuccessfulWriteMs = 0L
+    // Depth instrumentation: this queue holds up to MAX_QUEUE frames, which at 30fps is two
+    // seconds of video. If a link stall fills it and the drain then bursts, that is seen as a
+    // freeze followed by fast-forward catch-up — so how deep it actually gets is the question.
+    @Volatile private var maxQueueSeen = 0
+    @Volatile private var droppedFrames = 0L
+    @Volatile private var lastQueueReportMs = 0L
 
     var configPacket: ByteArray? = null
 
@@ -71,7 +84,10 @@ class StreamingServer(
         if (!queue.offer(packet)) {
             queue.poll()
             queue.offer(packet)
+            droppedFrames++
         }
+        val d = queue.size
+        if (d > maxQueueSeen) maxQueueSeen = d
     }
 
     private fun listenLoop() {
@@ -196,6 +212,16 @@ class StreamingServer(
     private fun sendLoop() {
         while (running.get()) {
             try {
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                if (nowMs - lastQueueReportMs >= 2000) {
+                    // Silent while healthy; a backlog is the only interesting case.
+                    if (lastQueueReportMs > 0L && (maxQueueSeen > 2 || droppedFrames > 0)) {
+                        Log.w(TAG, "QUEUE: depth=${queue.size} max=$maxQueueSeen/$MAX_QUEUE " +
+                                   "droppedTotal=$droppedFrames")
+                    }
+                    lastQueueReportMs = nowMs
+                    maxQueueSeen = queue.size
+                }
                 val packet = queue.poll(100, TimeUnit.MILLISECONDS) ?: continue
                 val out = output ?: continue
                 val now = android.os.SystemClock.elapsedRealtime()
